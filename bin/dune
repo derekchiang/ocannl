@@ -26,6 +26,14 @@
  (modes exe))
 
 (executable
+ (name bigram)
+ (modules bigram)
+ (libraries ocannl base stdio)
+ (preprocess
+  (pps ppx_here ppx_ocannl))
+ (modes exe))
+
+(executable
  (name hello_world_op)
  (modules hello_world_op)
  (libraries ocannl base stdio ppx_minidebug.runtime)

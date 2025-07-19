@@ -105,14 +105,14 @@ let () =
   let%op loss = neg (log output_probs) in
   Train.set_hosted loss.value;
 
-  let%op total_loss = loss ++ "...|...->... => 0" in
-  Train.set_hosted total_loss.value;
+  let%op batch_loss = (loss ++ "...|...->... => 0") /. !..batch_size in
+  Train.set_hosted batch_loss.value;
 
-  Train.forward_and_forget (module Backend) ctx total_loss;
+  Train.forward_and_forget (module Backend) ctx batch_loss;
   print_tensor inputs;
   print_tensor logits;
   print_tensor counts;
   print_tensor probs;
   print_tensor output_probs;
   print_tensor loss;
-  print_tensor total_loss
+  print_tensor batch_loss

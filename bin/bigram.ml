@@ -73,12 +73,9 @@ let () =
   Rand.init seed;
   Utils.settings.fixed_state_for_init <- Some seed;
 
-  let module Backend = (val Backends.fresh_backend ()) in
-  let stream = Backend.(new_stream @@ get_device ~ordinal:0) in
-  let ctx = Backend.make_context stream in
   let bigrams = get_all_bigrams () |> bigrams_to_indices in
 
-  let batch_size = 5 in
+  let batch_size = 255 in
   let int_input, int_output = List.unzip (List.take bigrams batch_size) in
 
   let input_tensor = tensor_of_int_list int_input in
@@ -108,11 +105,28 @@ let () =
   let%op batch_loss = (loss ++ "...|...->... => 0") /. !..batch_size in
   Train.set_hosted batch_loss.value;
 
-  Train.forward_and_forget (module Backend) ctx batch_loss;
-  print_tensor inputs;
-  print_tensor logits;
-  print_tensor counts;
-  print_tensor probs;
-  print_tensor output_probs;
-  print_tensor loss;
-  print_tensor batch_loss
+  let module Backend = (val Backends.fresh_backend ()) in
+  let stream = Backend.(new_stream @@ get_device ~ordinal:0) in
+  let ctx = Backend.make_context stream in
+  let init_params = Tensor.init_params batch_loss in
+  let init = Backend.link ctx @@ Backend.compile ctx.optimize_ctx IDX.empty init_params in
+  let ctx = init.context in
+  let update = Train.grad_update batch_loss in
+  let%op learning_rate = 5 in
+  let sgd = Train.sgd_update ~learning_rate batch_loss in
+  let routine = Train.to_routine (module Backend) ctx IDX.empty (Asgns.sequence [ update; sgd ]) in
+
+  Train.run init;
+  for epoch = 0 to 100 do
+    Train.run routine;
+    let open Operation.At in
+    Stdio.printf "Epoch %d, loss=%f\n%!" epoch batch_loss.@[0]
+    (* Train.forward_and_forget (module Backend) ctx batch_loss; *)
+    (* print_tensor inputs;
+    print_tensor logits;
+    print_tensor counts;
+    print_tensor probs;
+    print_tensor output_probs;
+    print_tensor loss;
+    print_tensor batch_loss *)
+  done

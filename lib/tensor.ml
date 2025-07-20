@@ -1,4 +1,5 @@
 open Base
+module Lazy = Utils.Lazy
 module Nd = Ir.Ndarray
 module Tn = Ir.Tnode
 module Asgns = Ir.Assignments
@@ -399,6 +400,22 @@ let number ?(label = []) ?axis_label ?(grad_spec = Prohibit_grad) c =
     if Tn.exceeds_fp16_cutoff t.value c then Tn.update_prec ~only_if:is_up_to_fp16 t.value single);
   t
 
+let constant_fill ~debug values =
+  match Array.length values with
+  | 0 -> (None, None)
+  | 1 -> (None, Some (Asgns.Constant values.(0)))
+  | n
+    when n
+         <= Int.of_string @@ Utils.get_global_arg ~default:"16" ~arg_name:"limit_constant_fill_size"
+    ->
+      (None, Some (Asgns.Constant_fill values))
+  | _ ->
+      let nd =
+        Nd.create_array ~debug ~dims:[| Array.length values |] ~padding:None !default_value_prec
+      in
+      Nd.set_flat_values nd values;
+      (Some (Asgns.Reshape nd), None)
+
 let ndarray ?(label = []) ?(grad_spec = Prohibit_grad) ?batch_dims ?input_dims ?output_dims
     ?batch_axes ?input_axes ?output_axes values =
   let num_label =
@@ -412,9 +429,10 @@ let ndarray ?(label = []) ?(grad_spec = Prohibit_grad) ?batch_dims ?input_dims ?
   let output_dims =
     Option.first_some output_dims @@ Option.some_if (Option.is_none output_axes) []
   in
+  let init_data, fetch_op = constant_fill ~debug:"Tensor.ndarray" values in
   let t =
     term ~label ~grad_spec ?batch_dims ?input_dims ?output_dims ?batch_axes ?input_axes ?output_axes
-      ~deduced:Not_constrained ~fetch_op:(Asgns.Constant_fill values) ()
+      ~deduced:Not_constrained ?init_data ?fetch_op ()
   in
   Tn.update_memory_mode t.value Effectively_constant 24;
   let max_abs = Array.fold values ~init:0. ~f:(fun acc v -> Float.(max acc @@ abs v)) in
@@ -423,8 +441,13 @@ let ndarray ?(label = []) ?(grad_spec = Prohibit_grad) ?batch_dims ?input_dims ?
       Tn.update_prec ~only_if:is_up_to_fp16 t.value single);
   t
 
-let fetch_param_init fetch_op =
-  term ~grad_spec:Require_grad ~batch_dims:[] ?batch_axes:None ?init_data:None ~fetch_op
+let param_init values =
+  let init_data, fetch_op = constant_fill ~debug:"Tensor.param_init" values in
+  term ~grad_spec:Require_grad ~batch_dims:[] ?batch_axes:None ?init_data ?fetch_op
+
+let term_init values =
+  let init_data, fetch_op = constant_fill ~debug:"Tensor.term_init" values in
+  term ?init_data ?fetch_op
 
 let param ?(more_label = []) ?input_dims ?output_dims ?input_axes ?output_axes ?deduced ~t label =
   let t =
@@ -587,11 +610,13 @@ let to_dag ?(single_node = false) ?(embedded_only = false) ?entries_per_axis ~sp
           grad_txt diff ^ if (not should_elide) && not embedded then " non-emb" else ""
         in
         let node =
+          if Lazy.is_val diff.grad.array then
           match Lazy.force diff.grad.array with
           | Some g_array ->
               Tn.do_read diff.grad;
               `Box (Nd.render_array ~brief:true ~prefix ?entries_per_axis ~labels ~indices g_array)
           | None -> `Text (prefix ^ " " ^ where_located diff.grad)
+          else `Text (prefix ^ " <not-in-yet> " ^ where_located diff.grad)
         in
         `Subtree_with_ID (id, `Tree (add_shape [ node ], children))
     | _, true, true, Some diff ->
@@ -643,7 +668,7 @@ let log_debug_info ~from_log_level t =
             Tn.log_debug_info ~from_log_level diff.grad]);
       List.iter ~f:log_child t.children]]
 
-let to_doc ?(spy = false) ~with_grad ~with_code ?(with_low_level = false)
+let to_doc ?(force_read = false) ~with_grad ~with_code ?(with_low_level = false)
     (style : array_print_style) t =
   let sh = t.shape in
   let label = Tn.label t.value in
@@ -701,7 +726,7 @@ let to_doc ?(spy = false) ~with_grad ~with_code ?(with_low_level = false)
   let open PPrint in
   (* Create document for tensor value *)
   let value_doc =
-    if spy && not (Lazy.is_val t.value.array) then
+    if not force_read && not (Lazy.is_val t.value.array) then
       string prefix_str ^^ string " <not-in-yet>" ^^ space
     else
       match (style, Lazy.force t.value.array) with
@@ -720,7 +745,7 @@ let to_doc ?(spy = false) ~with_grad ~with_code ?(with_low_level = false)
     if with_grad then
       match t.diff with
       | Some diff -> (
-          if spy && not (Lazy.is_val diff.grad.array) then
+          if not force_read && not (Lazy.is_val diff.grad.array) then
             string (grad_txt diff) ^^ string " <not-in-yet>" ^^ space
           else
             match Lazy.force diff.grad.array with
@@ -793,12 +818,12 @@ let to_doc ?(spy = false) ~with_grad ~with_code ?(with_low_level = false)
   (* Combine all documents and print *)
   group (value_doc ^^ break 1 ^^ grad_doc ^^ break 1 ^^ code_doc ^^ break 1 ^^ low_level_doc)
 
-let print ?here ?(spy = false) ~with_grad ~with_code ?(with_low_level = false)
+let print ?here ?(force_read = false) ~with_grad ~with_code ?(with_low_level = false)
     (style : array_print_style) t =
   Option.iter here ~f:(fun here ->
       Stdio.printf "HERE: %s\n%!" (Source_code_position.to_string here));
   PPrint.ToChannel.pretty 0.7 100 Stdio.stdout
-    (to_doc ~spy ~with_grad ~with_code ~with_low_level style t)
+    (to_doc ~force_read ~with_grad ~with_code ~with_low_level style t)
 
 let print_forward_roots ~with_grad ~with_code (style : array_print_style) =
   List.iter (Map.to_alist ~key_order:`Increasing session_state.forward_roots) ~f:(fun (id, root) ->

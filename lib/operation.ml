@@ -375,6 +375,7 @@ let embed_symbol ?(label = []) static_sym : Tensor.t =
     (Shape.make ~batch_dims:[] ~input_dims:[] ~output_dims:[ 1 ] ())
     []
 
+(* 
 let random_seed =
   let seed = Option.value ~default:42 @@ Utils.settings.fixed_state_for_init in
   let res =
@@ -384,7 +385,7 @@ let random_seed =
   in
   Tn.update_memory_mode res.value Tn.Effectively_constant 24;
   Tn.update_prec res.value Ir.Ops.uint4x32;
-  ref res
+  ref res *)
 
 module DO = struct
   let ( * ) = matmul ~grad_spec:If_needed
@@ -479,14 +480,14 @@ module TDSL = struct
   let ndarray = Tensor.ndarray ~grad_spec:If_needed
 
   (** The default initialization operation for {!param} calls. *)
-  let default_param_init = ref @@ Tensor.fetch_param_init (Asgns.Constant 0.0)
+  let default_param_init = ref @@ Tensor.param_init [| 0.0 |]
 
   let param ?value ?values =
     let t =
       match (value, values) with
       | Some _, Some _ -> invalid_arg "TDSL.param: both value and values are set"
-      | Some value, None -> Tensor.fetch_param_init (Asgns.Constant value)
-      | None, Some values -> Tensor.fetch_param_init (Asgns.Constant_fill values)
+      | Some value, None -> Tensor.param_init [| value |]
+      | None, Some values -> Tensor.param_init values
       | None, None -> !default_param_init
     in
     Tensor.param ~t

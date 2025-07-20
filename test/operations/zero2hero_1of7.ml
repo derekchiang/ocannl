@@ -1,6 +1,7 @@
 open Base
 open Ocannl
-module Tn = Ir.Tnode
+module Nd = Ir.Ndarray
+module Asgns = Ir.Assignments
 module IDX = Train.IDX
 module CDSL = Train.CDSL
 module TDSL = Operation.TDSL
@@ -26,7 +27,7 @@ let%expect_test "Graph drawing recompile" =
   let open Operation.At in
   let%op f_nd = (3 *. ("x" [ 5 ] **. 2)) - (4 *. x) + 5 in
   Train.set_hosted x.value;
-  Train.forward_and_forget backend ctx f_nd;
+  Train.forward_and_force backend ctx f_nd;
   Tensor.print_tree ~with_grad:true ~depth:9 f_nd;
   [%expect
     {|
@@ -160,7 +161,7 @@ let%expect_test "Graph drawing fetch" =
   let%op f x = (3 *. (x **. 2)) - (4 *. x) + 5 in
   let%op f5 = f 5 in
   Train.every_non_literal_on_host f5;
-  Train.forward_and_forget (module Backend) ctx f5;
+  Train.forward_and_force (module Backend) ctx f5;
   Tensor.print_tree ~with_grad:false ~depth:9 f5;
   [%expect
     {|
@@ -178,10 +179,7 @@ let%expect_test "Graph drawing fetch" =
   let size = 100 in
   let xs = Array.init size ~f:Float.(fun i -> (of_int i / 10.) - 5.) in
   (* Yay, the whole shape gets inferred! *)
-  let x_flat =
-    Tensor.term ~grad_spec:Require_grad ~label:[ "x_flat" ]
-      ~fetch_op:(Constant_fill xs)
-      ()
+  let x_flat = Tensor.term_init xs ~label:[ "x_flat" ] ~grad_spec:Require_grad ()
   in
   let step_sym, bindings = IDX.get_static_symbol ~static_range:size IDX.empty in
   let%op x = x_flat @| step_sym in
@@ -512,14 +510,11 @@ let%expect_test "2D neuron hosted" =
   Tensor.unsafe_reinitialize ();
   Rand.init 0;
   let module Backend = (val Backends.fresh_backend ()) in
-  let stream = Backend.(new_stream @@ get_device ~ordinal:0) in
-  let ctx = Backend.make_context stream in
   let%op v = ("w" [ (-3, 1) ] * "x" [ 2; 0 ]) + "b" [ 6.7 ] in
   Train.every_non_literal_on_host v;
   let update = Train.grad_update v in
-  let f_init = Train.to_routine (module Backend) ctx IDX.empty @@ Tensor.init_params v in
-  let routine = Train.to_routine (module Backend) f_init.context IDX.empty update in
-  Train.run f_init;
+  let ctx = Train.init_params (module Backend) IDX.empty v in
+  let routine = Train.to_routine (module Backend) ctx IDX.empty update in
   Train.run routine;
   Tensor.print_tree ~with_grad:true ~depth:9 v;
   [%expect
@@ -542,13 +537,10 @@ let%expect_test "2D neuron virtual" =
   Tensor.unsafe_reinitialize ();
   Rand.init 0;
   let module Backend = (val Backends.fresh_backend ()) in
-  let stream = Backend.(new_stream @@ get_device ~ordinal:0) in
-  let ctx = Backend.make_context stream in
   let%op v = ("w" [ (-3, 1) ] * "x" [ 2; 0 ]) + "b" [ 6.7 ] in
   let update = Train.grad_update v in
-  let f_init = Train.to_routine (module Backend) ctx IDX.empty @@ Tensor.init_params v in
-  let routine = Train.to_routine (module Backend) f_init.context IDX.empty update in
-  Train.run f_init;
+  let ctx = Train.init_params (module Backend) IDX.empty v in
+  let routine = Train.to_routine (module Backend) ctx IDX.empty update in
   Train.run routine;
   Tensor.print_tree ~with_grad:true ~depth:9 v;
   [%expect

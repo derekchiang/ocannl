@@ -67,19 +67,16 @@ let tensor_of_int_list lst =
   let len = List.length lst in
   let arr = lst |> List.map ~f:Float.of_int |> Array.of_list in
   let genarray = Genarray.create Bigarray.Float32 Bigarray.c_layout [| len; 27 |] in
+  (* convert to one-hot vectors *)
   for i = 0 to len - 1 do
-    (* convert to one-hot vectors *)
-    for j = 0 to 26 do
-      if Float.(of_int j = arr.(i)) then Genarray.set genarray [| i; j |] 1.
-      else Genarray.set genarray [| i; j |] 0.
-    done
+    Genarray.set genarray [| i; Int.of_float arr.(i) |] 1.
   done;
   let tensor = TDSL.rebatch ~l:"tensor" (Ir.Ndarray.as_array Ir.Ops.Single genarray) in
   print_tensor tensor;
   tensor
 
 let () =
-  let seed = 11 in
+  let seed = 13 in
   Rand.init seed;
   Utils.settings.fixed_state_for_init <- Some seed;
 
@@ -93,7 +90,7 @@ let () =
 
   (* let inputs = input_tensor |> one_hot ~num_classes:27 in let outputs = output_tensor |> one_hot
      ~num_classes:27 in Train.set_hosted inputs.value; *)
-  let batch_size = 2 in
+  let batch_size = 1 in
   let n_batches = input_size / batch_size in
   let batch_n, bindings = IDX.get_static_symbol ~static_range:n_batches IDX.empty in
 
@@ -101,24 +98,25 @@ let () =
   let%op output = outputs @| batch_n in
   (* let%cd _ = input =: 0 ++ "i=>32|i" in let%cd _ = output =: 0 ++ "i=>32|i" in *)
 
-  (* let random_weights = Array.init 27 ~f:(fun _ -> Random.float 2.0 -. 1.0) in *)
+  let random_weights = Array.init 27 ~f:(fun _ -> Random.float 2.0 -. 1.0) in
   (* let w = TDSL.param ~values:random_weights ~output_dims:[ 27 ] "w" in *)
   let%op logits = "w" 27 *. input in
+  Tn.set_values w.value random_weights;
   Train.set_hosted logits.value;
 
   let%op counts = exp logits in
   Train.set_hosted counts.value;
 
-  let%op probs = counts /. (counts ++ "b|...->... => b|0") in
+  let%op probs = counts /. (counts ++ "b|... => b|0") in
   Train.set_hosted probs.value;
 
-  let%op output_probs = (probs *. output) ++ "b|...->... => b|0" in
+  let%op output_probs = (probs *. output) ++ "b|... => b|0" in
   Train.set_hosted output_probs.value;
 
   let%op loss = neg (log output_probs) in
   Train.set_hosted loss.value;
 
-  let%op batch_loss = (loss ++ "...|...->... => 0") /. !..batch_size in
+  let%op batch_loss = (loss ++ "...|... => 0") /. !..batch_size in
   Train.set_hosted batch_loss.value;
 
   let module Backend = (val Backends.fresh_backend ()) in
@@ -128,13 +126,15 @@ let () =
   let init = Backend.link ctx @@ Backend.compile ctx.optimize_ctx IDX.empty init_params in
   let ctx = init.context in
   let update = Train.grad_update batch_loss in
-  let%op learning_rate = 0.1 in
+  let%op learning_rate = 1 in
   let sgd = Train.sgd_update ~learning_rate batch_loss in
   let routine = Train.to_routine (module Backend) ctx bindings (Asgns.sequence [ update; sgd ]) in
 
   let batch_ref = IDX.find_exn routine.bindings batch_n in
-  Train.run init;
-  for epoch = 0 to 10 do
+  (* running the init sets the weights to zero... how to avoid that? *)
+  (* Train.run init; *)
+  Train.every_non_literal_on_host batch_loss;
+  for epoch = 0 to 0 do
     for batch = 0 to n_batches - 1 do
       batch_ref := batch;
       Train.run routine
@@ -151,4 +151,10 @@ let () =
     Stdio.printf "Epoch %d, loss=%f\n%!" epoch batch_loss.@[0]
   done;
   print_tensor inputs;
-  print_tensor input
+  print_tensor input;
+  print_tensor w;
+  print_tensor logits;
+  print_tensor counts;
+  print_tensor output_probs;
+  print_tensor loss;
+  print_tensor batch_loss

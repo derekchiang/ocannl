@@ -63,7 +63,7 @@ let%expect_test "Matrix multiplication dims 1x1" =
   let%op y = ("hey" 7.0 * 'q' 2.0) + 'p' 1.0 in
   Train.forward_and_force backend ctx y;
   (* Punning for ["hey"] above introduced the [hey] identifier. *)
-  Tensor.print ~here:[%here] ~force_read:true ~with_code:false ~with_grad:false `Default @@ hey;
+  Tensor.print ~here:[%here] ~force:true ~with_code:false ~with_grad:false `Default @@ hey;
   [%expect
     {|
     HERE: test/operations/hello_world_op.ml:66:21
@@ -99,17 +99,21 @@ let%expect_test "Print tensor too early" =
   let%op b = [| 2.; 3.; 4.; 5. |] in
   print_tensor ~here:[%here] `Default a;
   print_tensor ~here:[%here] `Default b;
-  [%expect {|
+  [%expect
+    {|
     HERE: test/operations/hello_world_op.ml:100:21
-    [0]: 1,2,3,4_a shape 0:4|  <not-in-yet>HERE: test/operations/hello_world_op.ml:101:21
+    [0]: 1,2,3,4_a shape 0:4|  <not-in-yet>
+
+    HERE: test/operations/hello_world_op.ml:101:21
     [1]: 2,3,4,5_b shape 0:4|  <not-in-yet>
     |}];
   let%op c = a *. b in
   let ctx = Train.init_params (module Backend) IDX.empty c in
   Train.forward_and_force (module Backend) ctx c;
   print_tensor ~here:[%here] `Default c;
-  [%expect {|
-    HERE: test/operations/hello_world_op.ml:110:21
+  [%expect
+    {|
+    HERE: test/operations/hello_world_op.ml:113:21
     ┌─────────────────────────────────┐
     │[2]: *._c shape 0:4|             │
     │┌┬──────────────────────────────┐│
@@ -141,7 +145,7 @@ let%expect_test "Print constant tensor" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Inline @@ hey;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:141:21
+    HERE: test/operations/hello_world_op.ml:145:21
     [0]: 1,2,3,4,5..._hey shape 1:3->0:2  [
        1.00 , 2.00 , 3.00
       ;  4.00 , 5.00 , 6.00
@@ -150,7 +154,7 @@ let%expect_test "Print constant tensor" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Default @@ hey;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:150:21
+    HERE: test/operations/hello_world_op.ml:154:21
     ┌─────────────────────────────────────┐
     │[0]: 1,2,3,4,5..._hey shape 1:3->0:2 │
     │┌──────┬──────────────────┐          │
@@ -166,7 +170,7 @@ let%expect_test "Print constant tensor" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Inline @@ hoo;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:166:21
+    HERE: test/operations/hello_world_op.ml:170:21
     [1]: 1,2,3,4,5..._hoo shape 0:2|1:3  [|
       [ 1.00 ; 2.00 ; 3.00 ]
       ; [ 4.00 ; 5.00 ; 6.00 ]
@@ -175,7 +179,7 @@ let%expect_test "Print constant tensor" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Default @@ hoo;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:175:21
+    HERE: test/operations/hello_world_op.ml:179:21
     ┌────────────────────────────────────┐
     │[1]: 1,2,3,4,5..._hoo shape 0:2|1:3 │
     │┌──────┬──────────────────┐         │
@@ -198,7 +202,7 @@ let%expect_test "Print constant tensor" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Inline @@ hey2;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:198:21
+    HERE: test/operations/hello_world_op.ml:202:21
     [2]: 1,2,3,4,5..._hey2 shape 1:2,2:3->0:4  [
        ( 1.00 , 2.00 , 3.00 ) , ( 4.00 , 5.00 , 6.00 )
       ;  ( 7.00 , 8.00 , 9.00 ) , ( 10.00 , 11.00 , 12.00 )
@@ -209,7 +213,7 @@ let%expect_test "Print constant tensor" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Default @@ hey2;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:209:21
+    HERE: test/operations/hello_world_op.ml:213:21
     ┌────────────────────────────────────────────────────────────────┐
     │[2]: 1,2,3,4,5..._hey2 shape 1:2,2:3->0:4                       │
     │┌──────┬───────────────────────────┬───────────────────────────┐│
@@ -235,7 +239,7 @@ let%expect_test "Print constant tensor" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Inline @@ hoo2;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:235:21
+    HERE: test/operations/hello_world_op.ml:239:21
     [3]: 1,2,3,4,5..._hoo2 shape 0:4|1:2,2:3  [|
       [ [ 1.00 ; 2.00 ; 3.00 ] ; [ 4.00 ; 5.00 ; 6.00 ] ]
       ; [ [ 7.00 ; 8.00 ; 9.00 ] ; [ 10.00 ; 11.00 ; 12.00 ] ]
@@ -246,7 +250,7 @@ let%expect_test "Print constant tensor" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Default @@ hoo2;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:246:21
+    HERE: test/operations/hello_world_op.ml:250:21
     ┌───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
     │[3]: 1,2,3,4,5..._hoo2 shape 0:4|1:2,2:3                                                                       │
     │┌──────┬──────────────────┬───────────────────────────┬───────────────────────────┬───────────────────────────┐│
@@ -270,7 +274,7 @@ let%expect_test "Print constant tensor" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Inline @@ heyhoo;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:270:21
+    HERE: test/operations/hello_world_op.ml:274:21
     [4]: 1,2,3,4,5..._heyhoo shape 0:4,1:2|2:3  [|
       [| [ 1.00 ; 2.00 ; 3.00 ] ; [ 4.00 ; 5.00 ; 6.00 ] |]
       ; [| [ 7.00 ; 8.00 ; 9.00 ] ; [ 10.00 ; 11.00 ; 12.00 ] |]
@@ -281,7 +285,7 @@ let%expect_test "Print constant tensor" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Default @@ heyhoo;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:281:21
+    HERE: test/operations/hello_world_op.ml:285:21
     ┌───────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
     │[4]: 1,2,3,4,5..._heyhoo shape 0:4,1:2|2:3                                                                     │
     │┌──────┬──────────────────┬───────────────────────────┬───────────────────────────┬───────────────────────────┐│
@@ -305,7 +309,7 @@ let%expect_test "Print constant tensor" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Inline @@ heyhoo2;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:305:21
+    HERE: test/operations/hello_world_op.ml:309:21
     [5]: 1,31,2,32,3..._heyhoo2 shape 0:4,1:2|2:3,3:2  [|
       [|
         [ [ 1.00 ; 31.00 ] ; [ 2.00 ; 32.00 ] ; [ 3.00 ; 33.00 ] ]
@@ -328,7 +332,7 @@ let%expect_test "Print constant tensor" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Default @@ heyhoo2;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:328:21
+    HERE: test/operations/hello_world_op.ml:332:21
     ┌──────────────────────────────────────────────────┐
     │[5]: 1,31,2,32,3..._heyhoo2 shape 0:4,1:2|2:3,3:2 │
     │┌──────┬──────────────────┬──────────────────┐    │
@@ -369,7 +373,7 @@ let%expect_test "Print constant tensor" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Inline @@ heyhoo3;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:369:21
+    HERE: test/operations/hello_world_op.ml:373:21
     [6]: 1,31,2,32,3..._heyhoo3 shape 0:2,1:2|2:2,3:3,4:2  [|
       [|
         [
@@ -396,7 +400,7 @@ let%expect_test "Print constant tensor" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Default @@ heyhoo3;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:396:21
+    HERE: test/operations/hello_world_op.ml:400:21
     ┌──────────────────────────────────────────────────────┐
     │[6]: 1,31,2,32,3..._heyhoo3 shape 0:2,1:2|2:2,3:3,4:2 │
     │┌──────┬───────────────┬──────────────────┐           │
@@ -442,7 +446,7 @@ let%expect_test "Print constant tensor" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Inline @@ heyhoo4;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:442:21
+    HERE: test/operations/hello_world_op.ml:446:21
     [7]: 1,31,2,32,3..._heyhoo4 shape 0:2|4:2->1:2,2:2,3:3  [|
       [
         [
@@ -469,7 +473,7 @@ let%expect_test "Print constant tensor" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Default @@ heyhoo4;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:469:21
+    HERE: test/operations/hello_world_op.ml:473:21
     ┌───────────────────────────────────────────────────────┐
     │[7]: 1,31,2,32,3..._heyhoo4 shape 0:2|4:2->1:2,2:2,3:3 │
     │┌──────┬───────────────┬──────────────────┐            │
@@ -517,10 +521,10 @@ let%expect_test "Matrix multiplication dims 2x3" =
   (* Hey is inferred to be a matrix. *)
   let%op y = ("hey" 7.0 * [ 2; 3 ]) + [ 4; 5; 6 ] in
   Train.forward_and_force backend ctx y;
-  Tensor.print ~here:[%here] ~force_read:true ~with_code:false ~with_grad:false `Default @@ hey;
+  Tensor.print ~here:[%here] ~force:true ~with_code:false ~with_grad:false `Default @@ hey;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:520:21
+    HERE: test/operations/hello_world_op.ml:524:21
     ┌────────────────────────┐
     │[0]: hey shape 1:2->0:3 │
     │┌──────┬────────────┐   │
@@ -535,7 +539,7 @@ let%expect_test "Matrix multiplication dims 2x3" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Default @@ y;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:535:21
+    HERE: test/operations/hello_world_op.ml:539:21
     ┌──────────────────────────────┐
     │[6]: +_y shape 0:3            │
     │┌┬───────────────────────────┐│
@@ -565,10 +569,10 @@ let%expect_test "Big matrix" =
   let zero_to_twenty = TDSL.range 20 in
   let y = TDSL.O.((hey * zero_to_twenty) + zero_to_twenty) in
   Train.forward_and_force backend ctx y;
-  Tensor.print ~here:[%here] ~force_read:true ~with_code:false ~with_grad:false `Default hey;
+  Tensor.print ~here:[%here] ~force:true ~with_code:false ~with_grad:false `Default hey;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:568:21
+    HERE: test/operations/hello_world_op.ml:572:21
     ┌──────────────────────────────────────────────────┐
     │[0]: hey shape 1:21->0:21                         │
     │┌──────┬─────────────────────────────────────────┐│
@@ -585,7 +589,7 @@ let%expect_test "Big matrix" =
   Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Default y;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:585:21
+    HERE: test/operations/hello_world_op.ml:589:21
     ┌────────────────────────────────────────────┐
     │[5]: + shape 0:21                           │
     │┌┬─────────────────────────────────────────┐│
@@ -616,10 +620,10 @@ let%expect_test "Very big tensor" =
   let%op hoo = (hey * (1 + 1)) - 10 in
   Train.set_hosted hey.value;
   Train.forward_and_force backend ctx hoo;
-  Tensor.print ~here:[%here] ~force_read:true ~with_code:false ~with_grad:false `Default hey;
+  Tensor.print ~here:[%here] ~force:true ~with_code:false ~with_grad:false `Default hey;
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:619:21
+    HERE: test/operations/hello_world_op.ml:623:21
     ┌───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
     │[0]: r6x10x11x7x8x9 shape 0:6|3:7,4:8,5:9->1:10,2:11                                                                                                                                   │
     │┌──────┬─────────────────────────────────────────┬─────────────────────────────────────────┬──────┬─────────────────────────────────────────┬─────────────────────────────────────────┐│
@@ -757,7 +761,7 @@ let%expect_test "Very big tensor" =
   (* Disable line wrapping for viewing the output. In VSCode: `View: Toggle Word Wrap`. *)
   [%expect
     {|
-    HERE: test/operations/hello_world_op.ml:756:21
+    HERE: test/operations/hello_world_op.ml:760:21
     ┌───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
     │[6]: -_hoo shape 0:6|1:10,2:11                                                                                                                                                         │
     │┌──────┬─────────────────────────────────────────┬─────────────────────────────────────────┬──────┬─────────────────────────────────────────┬─────────────────────────────────────────┐│

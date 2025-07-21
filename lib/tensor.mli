@@ -47,9 +47,10 @@ and comparator_witness
 
 val comparator : (t, comparator_witness) Base.Comparator.t
 
-val init_params : t -> comp
-(** [init_params t] collects into a single sequence the {!field:forward} code of [t.params], and
-    transitively the initializations of the parameters of the parameters. *)
+val init_params : ?skip: 'a Map.M(Ir.Tnode).t -> t -> comp
+(** [init_params ?skip t] collects into a single sequence the {!field:forward} code of [t.params],
+    and transitively the initializations of the parameters of the parameters. If [skip] is provided,
+    it is used to filter out the parameters that are already initialized. *)
 
 val is_fwd_root : t -> bool
 val remove_fwd_root : t -> unit
@@ -345,7 +346,7 @@ val to_printbox :
   PrintBox.t
 
 val to_doc :
-  ?force_read:bool ->
+  ?force:bool ->
   with_grad:bool ->
   with_code:bool ->
   ?with_low_level:bool ->
@@ -355,7 +356,7 @@ val to_doc :
 
 val print :
   ?here:Ppx_here_lib.position ->
-  ?force_read:bool ->
+  ?force:bool ->
   with_grad:bool ->
   with_code:bool ->
   ?with_low_level:bool ->

@@ -81,7 +81,7 @@ let () =
   Utils.settings.fixed_state_for_init <- Some seed;
 
   let bigrams = get_all_bigrams () |> bigrams_to_indices in
-  let input_size = 100 in
+  let input_size = 200000 in
 
   let int_input, int_output = List.unzip (List.take bigrams input_size) in
 
@@ -90,7 +90,7 @@ let () =
 
   (* let inputs = input_tensor |> one_hot ~num_classes:27 in let outputs = output_tensor |> one_hot
      ~num_classes:27 in Train.set_hosted inputs.value; *)
-  let batch_size = 100 in
+  let batch_size = 1000 in
   let n_batches = input_size / batch_size in
   let batch_n, bindings = IDX.get_static_symbol ~static_range:n_batches IDX.empty in
 

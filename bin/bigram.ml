@@ -1,6 +1,7 @@
 open Base
 open Ocannl
 open Stdio
+open Bigarray
 module Tn = Ir.Tnode
 module IDX = Train.IDX
 module TDSL = Operation.TDSL
@@ -36,10 +37,9 @@ let char_index c =
 let bigrams_to_indices bigrams = List.(bigrams >>| fun (c1, c2) -> (char_index c1, char_index c2))
 let print_tensor t = Tensor.print ~here:[%here] ~with_code:false ~with_grad:false `Default t
 
-let one_hot ~num_classes indices =
+let _one_hot ~num_classes indices =
   let num_classes = num_classes - 1 in
   let%op classes = TDSL.range num_classes in
-  print_tensor classes;
   let%op indices_expanded = indices ++ "b|1 => b|i" in
   let%op classes_expanded = classes ++ "i => b|i" in
   let%op one_hot = indices_expanded = classes_expanded in
@@ -58,15 +58,25 @@ let _print_range_tensor () =
   let%op tensor = TDSL.range upto in
   (* let%op classes = TDSL.range num_classes in *)
 
-  Train.forward_and_forget (module Backend) ctx tensor;
+  Train.forward_and_force (module Backend) ctx tensor;
   print_tensor tensor
 
 (* let () = _print_range_tensor () *)
 
 let tensor_of_int_list lst =
-  let size = List.length lst in
-  lst |> List.map ~f:Float.of_int |> Array.of_list
-  |> Tensor.ndarray ~batch_dims:[ size ] ~output_dims:[ 1 ]
+  let len = List.length lst in
+  let arr = lst |> List.map ~f:Float.of_int |> Array.of_list in
+  let genarray = Genarray.create Bigarray.Float32 Bigarray.c_layout [| len; 27 |] in
+  for i = 0 to len - 1 do
+    (* convert to one-hot vectors *)
+    for j = 0 to 26 do
+      if Float.(of_int j = arr.(i)) then Genarray.set genarray [| i; j |] 1.
+      else Genarray.set genarray [| i; j |] 0.
+    done
+  done;
+  let tensor = TDSL.rebatch ~l:"tensor" (Ir.Ndarray.as_array Ir.Ops.Single genarray) in
+  print_tensor tensor;
+  tensor
 
 let () =
   let seed = 11 in
@@ -74,20 +84,26 @@ let () =
   Utils.settings.fixed_state_for_init <- Some seed;
 
   let bigrams = get_all_bigrams () |> bigrams_to_indices in
+  let input_size = List.length bigrams in
 
-  let batch_size = 255 in
-  let int_input, int_output = List.unzip (List.take bigrams batch_size) in
+  let int_input, int_output = List.unzip (List.take bigrams input_size) in
 
-  let input_tensor = tensor_of_int_list int_input in
-  let output_tensor = tensor_of_int_list int_output in
+  let inputs = tensor_of_int_list int_input in
+  let outputs = tensor_of_int_list int_output in
 
-  let inputs = input_tensor |> one_hot ~num_classes:27 in
-  let outputs = output_tensor |> one_hot ~num_classes:27 in
-  Train.set_hosted inputs.value;
+  (* let inputs = input_tensor |> one_hot ~num_classes:27 in let outputs = output_tensor |> one_hot
+     ~num_classes:27 in Train.set_hosted inputs.value; *)
+  let batch_size = 2 in
+  let n_batches = input_size / batch_size in
+  let batch_n, bindings = IDX.get_static_symbol ~static_range:n_batches IDX.empty in
 
-  let random_weights = Array.init 27 ~f:(fun _ -> Random.float 2.0 -. 1.0) in
-  let w = TDSL.param ~values:random_weights ~output_dims:[ 27 ] "w" in
-  let%op logits = w *. inputs in
+  let%op input = inputs @| batch_n in
+  let%op output = outputs @| batch_n in
+  (* let%cd _ = input =: 0 ++ "i=>32|i" in let%cd _ = output =: 0 ++ "i=>32|i" in *)
+
+  (* let random_weights = Array.init 27 ~f:(fun _ -> Random.float 2.0 -. 1.0) in *)
+  (* let w = TDSL.param ~values:random_weights ~output_dims:[ 27 ] "w" in *)
+  let%op logits = "w" 27 *. input in
   Train.set_hosted logits.value;
 
   let%op counts = exp logits in
@@ -96,7 +112,7 @@ let () =
   let%op probs = counts /. (counts ++ "b|...->... => b|0") in
   Train.set_hosted probs.value;
 
-  let%op output_probs = (probs *. outputs) ++ "b|...->... => b|0" in
+  let%op output_probs = (probs *. output) ++ "b|...->... => b|0" in
   Train.set_hosted output_probs.value;
 
   let%op loss = neg (log output_probs) in
@@ -112,21 +128,27 @@ let () =
   let init = Backend.link ctx @@ Backend.compile ctx.optimize_ctx IDX.empty init_params in
   let ctx = init.context in
   let update = Train.grad_update batch_loss in
-  let%op learning_rate = 5 in
+  let%op learning_rate = 0.1 in
   let sgd = Train.sgd_update ~learning_rate batch_loss in
-  let routine = Train.to_routine (module Backend) ctx IDX.empty (Asgns.sequence [ update; sgd ]) in
+  let routine = Train.to_routine (module Backend) ctx bindings (Asgns.sequence [ update; sgd ]) in
 
+  let batch_ref = IDX.find_exn routine.bindings batch_n in
   Train.run init;
-  for epoch = 0 to 100 do
-    Train.run routine;
-    let open Operation.At in
-    Stdio.printf "Epoch %d, loss=%f\n%!" epoch batch_loss.@[0]
-    (* Train.forward_and_forget (module Backend) ctx batch_loss; *)
-    (* print_tensor inputs;
+  for epoch = 0 to 10 do
+    for batch = 0 to n_batches - 1 do
+      batch_ref := batch;
+      Train.run routine
+      (* Train.forward_and_forget (module Backend) ctx batch_loss; *)
+      (* print_tensor inputs;
     print_tensor logits;
     print_tensor counts;
     print_tensor probs;
     print_tensor output_probs;
     print_tensor loss;
     print_tensor batch_loss *)
-  done
+    done;
+    let open Operation.At in
+    Stdio.printf "Epoch %d, loss=%f\n%!" epoch batch_loss.@[0]
+  done;
+  print_tensor inputs;
+  print_tensor input

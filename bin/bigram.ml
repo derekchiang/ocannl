@@ -66,12 +66,12 @@ let _print_range_tensor () =
 let tensor_of_int_list lst =
   let len = List.length lst in
   let arr = lst |> List.map ~f:Float.of_int |> Array.of_list in
-  let genarray = Genarray.create Bigarray.Float32 Bigarray.c_layout [| len; 27 |] in
+  let genarray = Genarray.create Bigarray.Float64 Bigarray.c_layout [| len; 27 |] in
   (* convert to one-hot vectors *)
   for i = 0 to len - 1 do
     Genarray.set genarray [| i; Int.of_float arr.(i) |] 1.
   done;
-  let tensor = TDSL.rebatch ~l:"tensor" (Ir.Ndarray.as_array Ir.Ops.Single genarray) in
+  let tensor = TDSL.rebatch ~l:"tensor" (Ir.Ndarray.as_array Ir.Ops.Double genarray) in
   print_tensor tensor;
   tensor
 
@@ -81,7 +81,7 @@ let () =
   Utils.settings.fixed_state_for_init <- Some seed;
 
   let bigrams = get_all_bigrams () |> bigrams_to_indices in
-  let input_size = List.length bigrams in
+  let input_size = 100 in
 
   let int_input, int_output = List.unzip (List.take bigrams input_size) in
 
@@ -90,7 +90,7 @@ let () =
 
   (* let inputs = input_tensor |> one_hot ~num_classes:27 in let outputs = output_tensor |> one_hot
      ~num_classes:27 in Train.set_hosted inputs.value; *)
-  let batch_size = 1 in
+  let batch_size = 100 in
   let n_batches = input_size / batch_size in
   let batch_n, bindings = IDX.get_static_symbol ~static_range:n_batches IDX.empty in
 
@@ -119,22 +119,18 @@ let () =
   let%op batch_loss = (loss ++ "...|... => 0") /. !..batch_size in
   Train.set_hosted batch_loss.value;
 
-  let module Backend = (val Backends.fresh_backend ()) in
-  let stream = Backend.(new_stream @@ get_device ~ordinal:0) in
-  let ctx = Backend.make_context stream in
-  let init_params = Tensor.init_params batch_loss in
-  let init = Backend.link ctx @@ Backend.compile ctx.optimize_ctx IDX.empty init_params in
-  let ctx = init.context in
   let update = Train.grad_update batch_loss in
   let%op learning_rate = 1 in
   let sgd = Train.sgd_update ~learning_rate batch_loss in
+
+  let module Backend = (val Backends.fresh_backend ()) in
+  let ctx = Train.init_params (module Backend) bindings batch_loss in
   let routine = Train.to_routine (module Backend) ctx bindings (Asgns.sequence [ update; sgd ]) in
 
   let batch_ref = IDX.find_exn routine.bindings batch_n in
   (* running the init sets the weights to zero... how to avoid that? *)
   (* Train.run init; *)
-  Train.every_non_literal_on_host batch_loss;
-  for epoch = 0 to 0 do
+  for epoch = 0 to 100 do
     for batch = 0 to n_batches - 1 do
       batch_ref := batch;
       Train.run routine

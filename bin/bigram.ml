@@ -45,24 +45,6 @@ let _one_hot ~num_classes indices =
   let%op one_hot = indices_expanded = classes_expanded in
   one_hot
 
-let _print_range_tensor () =
-  let seed = 3 in
-  Rand.init seed;
-  Utils.settings.fixed_state_for_init <- Some seed;
-
-  let module Backend = (val Backends.fresh_backend ()) in
-  let stream = Backend.(new_stream @@ get_device ~ordinal:0) in
-  let ctx = Backend.make_context stream in
-  let upto = 5 in
-  (* let num_classes = 3 in *)
-  let%op tensor = TDSL.range upto in
-  (* let%op classes = TDSL.range num_classes in *)
-
-  Train.forward_and_force (module Backend) ctx tensor;
-  print_tensor tensor
-
-(* let () = _print_range_tensor () *)
-
 let tensor_of_int_list lst =
   let len = List.length lst in
   let arr = lst |> List.map ~f:Float.of_int |> Array.of_list in

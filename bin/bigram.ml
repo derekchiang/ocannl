@@ -86,11 +86,11 @@ let () =
   let%op output = outputs @| batch_n in
   (* let%cd _ = input =: 0 ++ "i=>32|i" in let%cd _ = output =: 0 ++ "i=>32|i" in *)
 
-  let mlp input =
-    let random_weights = Array.init 27 ~f:(fun _ -> Random.float 2.0 -. 1.0) in
-    (* let w = TDSL.param ~values:random_weights ~output_dims:[ 27 ] "w" in *)
-    let%op logits = "w" 27 *. input in
-    Tn.set_values w.value random_weights;
+  let w = TDSL.param ~input_dims:[ 27 ] ~output_dims:[ 27 ] "w" in
+  let random_weights = Array.init (27 * 27) ~f:(fun _ -> Random.float 2.0 -. 1.0) in
+  Tn.set_values w.value random_weights;
+  let%op mlp input =
+    let%op logits = w * input in
     Train.set_hosted logits.value;
 
     let%op counts = exp logits in
@@ -156,8 +156,33 @@ let () =
   let infer c =
     let c_one_hot = char_to_one_hot c in
     Tn.set_values cha.value c_one_hot;
+    print_tensor cha;
     Utils.capture_stdout_logs @@ fun () ->
     Train.run infer_probs_routine;
-    infer_probs.@[char_index c]
+
+    let dice = Random.float 1. in
+
+    let rec aux i sum =
+      let prob = infer_probs.@{[| 0; i |]} in
+      Stdio.printf "prob: %f\n" prob;
+      let new_sum = sum +. prob in
+      if Float.compare new_sum dice > 0 then List.nth_exn letters_with_dot i
+      else aux (i + 1) new_sum
+    in
+
+    aux 0 0.
   in
-  Stdio.printf "Prob: %f\n" (infer 'c')
+
+  let gen_name () =
+    let rec aux c name =
+      if Char.equal c '.' && not (String.equal name "") then name
+      else
+        let next_char = infer c in
+        aux next_char (name ^ String.make 1 c)
+    in
+    let name_with_dot = aux '.' "" in
+    String.drop_prefix name_with_dot 1
+  in
+
+  let names = Array.init 20 ~f:(fun _ -> gen_name ()) in
+  Array.iter names ~f:print_endline

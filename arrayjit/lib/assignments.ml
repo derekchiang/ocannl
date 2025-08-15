@@ -21,6 +21,7 @@ type buffer = Node of Tn.t | Merge_buffer of Tn.t [@@deriving sexp_of, equal]
 (** Resets a array by performing the specified computation or data fetching. *)
 type fetch_op =
   | Constant of float
+  | Constant_bits of int64  (** Direct bit representation, primarily for uint4x32 *)
   | Constant_fill of float array
       (** Fills in the numbers where the rightmost axis is contiguous. Primes shape inference to
           require the assigned tensor to have the same number of elements as the array, but in case
@@ -95,7 +96,11 @@ let get_name_exn asgns =
   if String.is_empty result then invalid_arg "Assignments.get_name: no comments in code" else result
 
 let is_total ~initialize_neutral ~projections =
-  initialize_neutral && Indexing.is_bijective projections
+  initialize_neutral && Indexing.is_surjective projections
+
+let can_skip_accumulation ~projections =
+  (* We can skip accumulation (use = instead of +=) only if the projection is injective *)
+  Indexing.is_injective projections
 
 (** Returns materialized nodes in the sense of {!Tnode.is_in_context_force}. NOTE: it must be called
     after compilation; otherwise, it will disrupt memory mode inference. *)
@@ -225,7 +230,7 @@ let%track4_sexp to_low_level code =
       let lhs_ll = get (Node lhs) lhs_idcs in
       let rhses_ll = Array.mapi rhses_idcs ~f:(fun i rhs_idcs -> get rhses.(i) rhs_idcs) in
       let rhs2 = apply_op op rhses_ll in
-      if is_total ~initialize_neutral ~projections then set lhs lhs_idcs rhs2
+      if initialize_neutral && can_skip_accumulation ~projections then set lhs lhs_idcs rhs2
       else set lhs lhs_idcs @@ apply_op (Ops.Binop accum) [| lhs_ll; rhs2 |]
     in
     let rec for_loop rev_iters = function
@@ -242,7 +247,16 @@ let%track4_sexp to_low_level code =
             }
     in
     let for_loops = for_loop [] (Array.to_list projections.product_space) in
-    if initialize_neutral && not (is_total ~initialize_neutral ~projections) then
+    (* Need initialization if:
+       - initialize_neutral is true AND
+       - (not surjective OR not injective)
+       Not surjective: some positions never written (need init to avoid garbage)
+       Not injective: accumulation needed (need init for first += operation) *)
+    let needs_init = 
+      initialize_neutral && 
+      not (Indexing.is_surjective projections && Indexing.is_injective projections)
+    in
+    if needs_init then
       let dims = lazy projections.lhs_dims in
       let fetch_op = Constant (Ops.neutral_elem accum) in
       Low_level.Seq (loop (Fetch { array = lhs; fetch_op; dims }), for_loops)
@@ -296,7 +310,7 @@ let%track4_sexp to_low_level code =
                 | Ops.Byte_prec _ | Ops.Fp8_prec _ -> 16 (* 8-bit values *)
                 | Ops.Uint16_prec _ | Ops.Half_prec _ | Ops.Bfloat16_prec _ -> 8 (* 16-bit values *)
                 | Ops.Int32_prec _ | Ops.Single_prec _ -> 4 (* 32-bit values *)
-                | Ops.Double_prec _ -> 2 (* 64-bit values *)
+                | Ops.Double_prec _ | Ops.Int64_prec _ -> 2 (* 64-bit values *)
                 | Ops.Uint4x32_prec _ -> 1 (* 128-bit value *)
                 | Ops.Void_prec -> failwith "Cannot use vector operation with void precision")
           in
@@ -326,6 +340,8 @@ let%track4_sexp to_low_level code =
     | Fetch { array; fetch_op = Constant 0.0; dims = _ } -> Low_level.Zero_out array
     | Fetch { array; fetch_op = Constant c; dims } ->
         Low_level.loop_over_dims (Lazy.force dims) ~body:(fun idcs -> set array idcs @@ Constant c)
+    | Fetch { array; fetch_op = Constant_bits i; dims } ->
+        Low_level.loop_over_dims (Lazy.force dims) ~body:(fun idcs -> set array idcs @@ Constant_bits i)
     | Fetch { array; fetch_op = Slice { batch_idx = { static_symbol = idx; _ }; sliced }; dims } ->
         (* TODO: doublecheck this always gets optimized away. *)
         Low_level.loop_over_dims (Lazy.force dims) ~body:(fun idcs ->
@@ -335,7 +351,7 @@ let%track4_sexp to_low_level code =
             set array idcs @@ Embed_index (Iterator s.static_symbol))
     | Fetch { array; fetch_op = Embed_self_id; dims } ->
         Low_level.loop_over_dims (Lazy.force dims) ~body:(fun idcs ->
-            set array idcs @@ Constant (Float.of_int array.id))
+            set array idcs @@ Constant_bits (Int64.of_int array.id))
     | Fetch { array; fetch_op = Range_over_offsets; dims = (lazy dims) } ->
         Low_level.loop_over_dims dims ~body:(fun idcs ->
             let offset = Indexing.reflect_projection ~dims ~projection:idcs in
@@ -422,6 +438,7 @@ let to_doc ?name ?static_indices () c =
   let doc_of_fetch_op (op : fetch_op) =
     match op with
     | Constant f -> string (Float.to_string f)
+    | Constant_bits i -> string (Printf.sprintf "bits(%LdLL)" i)
     | Constant_fill values ->
         let values_str =
           String.concat ~sep:", " (Array.to_list (Array.map values ~f:Float.to_string))

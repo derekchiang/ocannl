@@ -56,6 +56,7 @@ and scalar_t =
   | Binop of Ops.binop * scalar_t * scalar_t
   | Unop of Ops.unop * scalar_t
   | Constant of float
+  | Constant_bits of int64  (** Direct bit representation, primarily for uint4x32 *)
   | Embed_index of Indexing.axis_index
 [@@deriving sexp_of, equal, compare]
 
@@ -119,6 +120,7 @@ type traced_array = {
   mutable read_before_write : bool;
   mutable read_only : bool;
   mutable is_scalar_constexpr : bool;
+  mutable is_accessing : bool;
   mutable is_complex : bool;
 }
 [@@deriving sexp_of]
@@ -149,6 +151,7 @@ let get_node store tn =
         read_before_write = false;
         read_only = false;
         is_scalar_constexpr = false;
+        is_accessing = false;
         is_complex = false;
       })
 
@@ -175,34 +178,52 @@ let is_constexpr_comp traced_store llsc =
     | Ternop (_, v1, v2, v3) -> loop v1 && loop v2 && loop v3
     | Binop (_, v1, v2) -> loop v1 && loop v2
     | Unop (_, v) -> loop v
-    | Constant _ -> true
+    | Constant _ | Constant_bits _ -> true
     | Embed_index _ -> false
   in
   loop llsc
 
-let is_complex_comp traced_store llsc =
+let is_accessing_comp traced_store llsc =
   let rec loop llsc =
     match llsc with
     | Get_local { tn; _ } | Local_scope { id = { tn; _ }; _ } ->
         let traced = get_node traced_store tn in
-        traced.is_complex
+        traced.is_accessing
     | Get (tn, _) ->
         let traced = get_node traced_store tn in
         not traced.is_scalar_constexpr
     | Get_merge_buffer (tn, _) ->
         let traced = get_node traced_store tn in
-        not traced.is_scalar_constexpr
+        traced.is_accessing <- true;
+        true
     | Ternop (_, v1, v2, v3) -> loop v1 || loop v2 || loop v3
     | Binop (_, v1, v2) -> loop v1 || loop v2
     | Unop (_, v) -> loop v
-    | Constant _ -> false
+    | Constant _ | Constant_bits _ -> false
     | Embed_index _ -> false
   in
   loop llsc
 
+let is_complex_comp traced_store llsc =
+  let accessing = is_accessing_comp traced_store in
+  match llsc with
+  | Get_local { tn; _ } | Local_scope { id = { tn; _ }; _ } ->
+      let traced = get_node traced_store tn in
+      traced.is_complex
+  | Get _ -> false
+  | Get_merge_buffer _ -> false
+  | Ternop (_, v1, v2, v3) -> accessing v1 || accessing v2 || accessing v3
+  | Binop (_, v1, v2) -> accessing v1 || accessing v2
+  | Unop (_, v) -> accessing v
+  | Constant _ | Constant_bits _ -> false
+  | Embed_index _ -> false
+
 let is_scalar_dims tn = Array.for_all ~f:(( = ) 1) @@ Lazy.force tn.Tn.dims
 
 let visit_llc traced_store ~merge_node_id reverse_node_map ~max_visits llc =
+  let inline_complex_computations =
+    Utils.get_global_flag ~default:true ~arg_name:"inline_complex_computations"
+  in
   let is_too_many = function Visits i -> i > max_visits | Recurrent -> true in
   (* FIXME: migrate hashtable to use offsets instead of indices *)
   let lookup env indices =
@@ -234,11 +255,12 @@ let visit_llc traced_store ~merge_node_id reverse_node_map ~max_visits llc =
         let traced : traced_array = get_node traced_store tn in
         if Hash_set.is_empty traced.assignments && Hashtbl.is_empty traced.accesses then (
           traced.zero_initialized <- true;
+          traced.is_accessing <- false;
           traced.is_complex <- false;
           if is_scalar_dims tn then traced.is_scalar_constexpr <- true);
         traced.zeroed_out <- true
     | Set { tn; idcs; llsc; debug = _ } ->
-        loop_float env llsc;
+        loop_scalar env (Some (lookup env idcs)) llsc;
         let traced : traced_array = get_node traced_store tn in
         if
           Hash_set.is_empty traced.assignments
@@ -246,8 +268,9 @@ let visit_llc traced_store ~merge_node_id reverse_node_map ~max_visits llc =
         then traced.is_scalar_constexpr <- is_constexpr_comp traced_store llsc
           (* Note: this prevents detection if the same constant is assigned inside a loop. *)
         else if not @@ Hash_set.is_empty traced.assignments then traced.is_scalar_constexpr <- false;
-        if first_visit then
-          traced.is_complex <- traced.is_complex || is_complex_comp traced_store llsc;
+        if first_visit then (
+          traced.is_accessing <- traced.is_accessing || is_accessing_comp traced_store llsc;
+          traced.is_complex <- traced.is_complex || is_complex_comp traced_store llsc);
         Hash_set.add traced.assignments (lookup env idcs);
         Array.iter idcs ~f:(function
           | Fixed_idx _ -> ()
@@ -261,11 +284,13 @@ let visit_llc traced_store ~merge_node_id reverse_node_map ~max_visits llc =
                   let old_tn = Hashtbl.find_or_add reverse_node_map s ~default:(fun () -> tn) in
                   assert (Tn.equal old_tn tn)))
     | Set_from_vec { tn; idcs; length; vec_unop = _; arg; debug = _ } ->
-        loop_float env arg;
+        loop_scalar env (Some (lookup env idcs)) arg;
         let traced : traced_array = get_node traced_store tn in
         (* Vector operations cannot be scalar constexpr *)
         traced.is_scalar_constexpr <- false;
-        if first_visit then traced.is_complex <- false;
+        if first_visit then (
+          traced.is_accessing <- traced.is_accessing || is_accessing_comp traced_store arg;
+          traced.is_complex <- traced.is_complex || not (is_constexpr_comp traced_store arg));
         (* Mark all positions that will be written to *)
         for i = 0 to length - 1 do
           let pos_idcs = Array.copy idcs in
@@ -302,18 +327,23 @@ let visit_llc traced_store ~merge_node_id reverse_node_map ~max_visits llc =
               List.iter symbols ~f:(fun (_, s) ->
                   let old_tn = Hashtbl.find_or_add reverse_node_map s ~default:(fun () -> tn) in
                   assert (Tn.equal old_tn tn)))
-    | Set_local (_, llsc) -> loop_float env llsc
+    | Set_local (_, llsc) -> loop_scalar env None llsc
     | Comment _ -> ()
     | Staged_compilation _ -> ()
-  and loop_float env llsc =
-    let loop = loop_float env in
+  and loop_scalar env (access_pos : int array option) llsc =
+    let loop = loop_scalar env access_pos in
     match llsc with
-    | Constant _ -> ()
+    | Constant _ | Constant_bits _ -> ()
     | Get (ptr, indices) ->
         let traced : traced_array = get_node traced_store ptr in
         let at_pos = lookup env indices in
-        Hashtbl.update traced.accesses at_pos
-          ~f:(visit ~is_assigned:(traced.zeroed_out || Hash_set.mem traced.assignments at_pos))
+        if
+          (not inline_complex_computations)
+          || Option.value_map access_pos ~default:true ~f:(fun pos ->
+                 not ([%equal: int array] pos at_pos))
+        then
+          Hashtbl.update traced.accesses at_pos
+            ~f:(visit ~is_assigned:(traced.zeroed_out || Hash_set.mem traced.assignments at_pos))
     | Local_scope { body; _ } -> loop_proc ~first_visit:true env body
     | Get_local _ -> ()
     | Get_merge_buffer (source, _) ->
@@ -440,7 +470,7 @@ let%diagn2_sexp check_and_store_virtual computations_table traced static_indices
                     (top_llc : t)];
                 raise @@ Non_virtual 7
             | _ -> ());
-        loop_float ~env_dom llsc
+        loop_scalar ~env_dom llsc
     | Set_from_vec { tn; idcs; length = _; vec_unop = _; arg; debug = _ } ->
         if Tn.equal tn top_tn then (
           check_idcs idcs;
@@ -456,13 +486,13 @@ let%diagn2_sexp check_and_store_virtual computations_table traced static_indices
                     (top_llc : t)];
                 raise @@ Non_virtual 7
             | _ -> ());
-        loop_float ~env_dom arg
-    | Set_local (_, llsc) -> loop_float ~env_dom llsc
+        loop_scalar ~env_dom arg
+    | Set_local (_, llsc) -> loop_scalar ~env_dom llsc
     | Comment _ -> ()
     | Staged_compilation _ -> raise @@ Non_virtual 8
-  and loop_float ~env_dom llsc =
+  and loop_scalar ~env_dom llsc =
     match llsc with
-    | Constant _ -> ()
+    | Constant _ | Constant_bits _ -> ()
     | Get (tn, idcs) ->
         if Tn.equal tn top_tn then check_idcs idcs
         else
@@ -508,13 +538,13 @@ let%diagn2_sexp check_and_store_virtual computations_table traced static_indices
                   (top_llc : t)];
               raise @@ Non_virtual 10))
     | Ternop (_, llv1, llv2, llv3) ->
-        loop_float ~env_dom llv1;
-        loop_float ~env_dom llv2;
-        loop_float ~env_dom llv3
+        loop_scalar ~env_dom llv1;
+        loop_scalar ~env_dom llv2;
+        loop_scalar ~env_dom llv3
     | Binop (_, llv1, llv2) ->
-        loop_float ~env_dom llv1;
-        loop_float ~env_dom llv2
-    | Unop (_, llsc) -> loop_float ~env_dom llsc
+        loop_scalar ~env_dom llv1;
+        loop_scalar ~env_dom llv2
+    | Unop (_, llsc) -> loop_scalar ~env_dom llsc
   in
   try
     if Tn.known_non_virtual traced.tn then raise @@ Non_virtual 11;
@@ -605,7 +635,7 @@ let%track7_sexp inline_computation ~id
       | Zero_out tn when Tn.equal tn traced.tn -> Some (Set_local (id, Constant 0.0))
       | Set { tn; idcs; llsc; debug = _ } when Tn.equal tn traced.tn ->
           assert ([%equal: Indexing.axis_index array option] (Some idcs) def_args);
-          Some (Set_local (id, loop_float env llsc))
+          Some (Set_local (id, loop_scalar env llsc))
       | Set_from_vec { tn; idcs; length = _; vec_unop = _; arg = _; debug = _ }
         when Tn.equal tn traced.tn ->
           assert ([%equal: Indexing.axis_index array option] (Some idcs) def_args);
@@ -614,12 +644,12 @@ let%track7_sexp inline_computation ~id
       | Zero_out _ -> None
       | Set _ -> None
       | Set_from_vec _ -> None
-      | Set_local (id, llsc) -> Some (Set_local (id, loop_float env llsc))
+      | Set_local (id, llsc) -> Some (Set_local (id, loop_scalar env llsc))
       | Comment _ -> Some llc
       | Staged_compilation _ -> Some llc
-    and loop_float env llsc : scalar_t =
+    and loop_scalar env llsc : scalar_t =
       match llsc with
-      | Constant _ -> llsc
+      | Constant _ | Constant_bits _ -> llsc
       | Get (tn, indices) when Tn.equal tn traced.tn ->
           assert ([%equal: Indexing.axis_index array option] (Some indices) def_args);
           Get_local id
@@ -635,9 +665,9 @@ let%track7_sexp inline_computation ~id
       | Get_merge_buffer (tn, indices) -> Get_merge_buffer (tn, Array.map ~f:(subst env) indices)
       | Embed_index idx -> Embed_index (subst env idx)
       | Ternop (op, llv1, llv2, llv3) ->
-          Ternop (op, loop_float env llv1, loop_float env llv2, loop_float env llv3)
-      | Binop (op, llv1, llv2) -> Binop (op, loop_float env llv1, loop_float env llv2)
-      | Unop (op, llsc) -> Unop (op, loop_float env llsc)
+          Ternop (op, loop_scalar env llv1, loop_scalar env llv2, loop_scalar env llv3)
+      | Binop (op, llv1, llv2) -> Binop (op, loop_scalar env llv1, loop_scalar env llv2)
+      | Unop (op, llsc) -> Unop (op, loop_scalar env llsc)
     in
     loop env def
   in
@@ -691,7 +721,7 @@ let virtual_llc computations_table traced_store reverse_node_map static_indices 
     | Set { tn; idcs; llsc; debug } ->
         let traced : traced_array = get_node traced_store tn in
         let next = if Tn.known_non_virtual traced.tn then process_for else Set.add process_for tn in
-        let result = Set { tn; idcs; llsc = loop_float ~process_for:next llsc; debug } in
+        let result = Set { tn; idcs; llsc = loop_scalar ~process_for:next llsc; debug } in
         if (not @@ Set.mem process_for tn) && (not @@ Tn.known_non_virtual traced.tn) then
           check_and_store_virtual computations_table traced static_indices result;
         result
@@ -699,17 +729,19 @@ let virtual_llc computations_table traced_store reverse_node_map static_indices 
         let traced : traced_array = get_node traced_store tn in
         let next = if Tn.known_non_virtual traced.tn then process_for else Set.add process_for tn in
         let result =
-          Set_from_vec { tn; idcs; length; vec_unop; arg = loop_float ~process_for:next arg; debug }
+          Set_from_vec
+            { tn; idcs; length; vec_unop; arg = loop_scalar ~process_for:next arg; debug }
         in
         if (not @@ Set.mem process_for tn) && (not @@ Tn.known_non_virtual traced.tn) then
           check_and_store_virtual computations_table traced static_indices result;
         result
-    | Set_local (id, llsc) -> Set_local (id, loop_float ~process_for llsc)
+    | Set_local (id, llsc) -> Set_local (id, loop_scalar ~process_for llsc)
     | Comment _ -> llc
     | Staged_compilation _ -> llc
-  and loop_float ~process_for (llsc : scalar_t) : scalar_t =
+  and loop_scalar ~process_for (llsc : scalar_t) : scalar_t =
     match llsc with
     | Constant _ -> llsc
+    | Constant_bits _ -> llsc
     | Get (tn, _) when Set.mem process_for tn ->
         (* [Get_local] will replace this [Get] during [inline_computation] if [tn] remains
            virtual. *)
@@ -731,12 +763,12 @@ let virtual_llc computations_table traced_store reverse_node_map static_indices 
     | Ternop (op, llv1, llv2, llv3) ->
         Ternop
           ( op,
-            loop_float ~process_for llv1,
-            loop_float ~process_for llv2,
-            loop_float ~process_for llv3 )
+            loop_scalar ~process_for llv1,
+            loop_scalar ~process_for llv2,
+            loop_scalar ~process_for llv3 )
     | Binop (op, llv1, llv2) ->
-        Binop (op, loop_float ~process_for llv1, loop_float ~process_for llv2)
-    | Unop (op, llsc) -> Unop (op, loop_float ~process_for llsc)
+        Binop (op, loop_scalar ~process_for llv1, loop_scalar ~process_for llv2)
+    | Unop (op, llsc) -> Unop (op, loop_scalar ~process_for llsc)
   in
   loop_proc ~process_for:(Set.empty (module Tnode)) llc
 
@@ -777,7 +809,7 @@ let cleanup_virtual_llc reverse_node_map ~static_indices (llc : t) : t =
         else (
           assert (
             Array.for_all idcs ~f:(function Indexing.Iterator s -> Set.mem env_dom s | _ -> true));
-          Some (Set { tn; idcs; llsc = loop_float ~balanced ~env_dom llsc; debug }))
+          Some (Set { tn; idcs; llsc = loop_scalar ~balanced ~env_dom llsc; debug }))
     | Set_from_vec { tn; idcs; length; vec_unop; arg; debug } ->
         if not @@ Tn.known_non_virtual tn then (
           (* FIXME(#296): *)
@@ -788,17 +820,18 @@ let cleanup_virtual_llc reverse_node_map ~static_indices (llc : t) : t =
             Array.for_all idcs ~f:(function Indexing.Iterator s -> Set.mem env_dom s | _ -> true));
           Some
             (Set_from_vec
-               { tn; idcs; length; vec_unop; arg = loop_float ~balanced ~env_dom arg; debug }))
+               { tn; idcs; length; vec_unop; arg = loop_scalar ~balanced ~env_dom arg; debug }))
     | Set_local (id, llsc) ->
         assert (not @@ Tn.known_non_virtual id.tn);
         Tn.update_memory_mode id.tn Virtual 16;
-        Some (Set_local (id, loop_float ~balanced ~env_dom llsc))
+        Some (Set_local (id, loop_scalar ~balanced ~env_dom llsc))
     | Comment _ -> Some llc
     | Staged_compilation _ -> Some llc
-  and loop_float ~balanced ~env_dom (llsc : scalar_t) : scalar_t =
-    let loop = loop_float ~balanced ~env_dom in
+  and loop_scalar ~balanced ~env_dom (llsc : scalar_t) : scalar_t =
+    let loop = loop_scalar ~balanced ~env_dom in
     match llsc with
     | Constant _ -> llsc
+    | Constant_bits _ -> llsc
     | Get (a, indices) ->
         (* TODO(#296): this should probably already be Never_virtual, we could assert it. *)
         Tn.update_memory_mode a Never_virtual 17;
@@ -838,23 +871,25 @@ let cleanup_virtual_llc reverse_node_map ~static_indices (llc : t) : t =
   Option.value_exn ~here:[%here] @@ loop_proc ~balanced:false ~env_dom:static_indices llc
 
 let rec substitute_float ~var ~value llsc =
-  let loop_float = substitute_float ~var ~value in
+  let loop_scalar = substitute_float ~var ~value in
   let loop_proc = substitute_proc ~var ~value in
   if equal_scalar_t var llsc then value
   else
     match llsc with
     | Constant _ -> llsc
+    | Constant_bits _ -> llsc
     | Get (_ptr, _indices) -> llsc
     | Local_scope opts -> Local_scope { opts with body = loop_proc opts.body }
     | Get_local _ -> llsc
     | Get_merge_buffer (_, _) -> llsc
     | Embed_index _ -> llsc
-    | Ternop (op, llv1, llv2, llv3) -> Ternop (op, loop_float llv1, loop_float llv2, loop_float llv3)
-    | Binop (op, llv1, llv2) -> Binop (op, loop_float llv1, loop_float llv2)
-    | Unop (op, llsc) -> Unop (op, loop_float llsc)
+    | Ternop (op, llv1, llv2, llv3) ->
+        Ternop (op, loop_scalar llv1, loop_scalar llv2, loop_scalar llv3)
+    | Binop (op, llv1, llv2) -> Binop (op, loop_scalar llv1, loop_scalar llv2)
+    | Unop (op, llsc) -> Unop (op, loop_scalar llsc)
 
 and substitute_proc ~var ~value llc =
-  let loop_float = substitute_float ~var ~value in
+  let loop_scalar = substitute_float ~var ~value in
   let loop_proc = substitute_proc ~var ~value in
   match llc with
   | Noop -> Noop
@@ -864,10 +899,10 @@ and substitute_proc ~var ~value llc =
       Seq (c1, c2)
   | For_loop for_config -> For_loop { for_config with body = loop_proc for_config.body }
   | Zero_out _ -> llc
-  | Set { tn; idcs; llsc; debug } -> Set { tn; idcs; llsc = loop_float llsc; debug }
+  | Set { tn; idcs; llsc; debug } -> Set { tn; idcs; llsc = loop_scalar llsc; debug }
   | Set_from_vec { tn; idcs; length; vec_unop; arg; debug } ->
-      Set_from_vec { tn; idcs; length; vec_unop; arg = loop_float arg; debug }
-  | Set_local (id, llsc) -> Set_local (id, loop_float llsc)
+      Set_from_vec { tn; idcs; length; vec_unop; arg = loop_scalar arg; debug }
+  | Set_local (id, llsc) -> Set_local (id, loop_scalar llsc)
   | Comment _ -> llc
   | Staged_compilation _ -> llc
 
@@ -883,13 +918,13 @@ let simplify_llc llc =
         Seq (c1, c2)
     | For_loop for_config -> For_loop { for_config with body = loop for_config.body }
     | Zero_out _ -> llc
-    | Set { tn; idcs; llsc; debug } -> Set { tn; idcs; llsc = loop_float llsc; debug }
+    | Set { tn; idcs; llsc; debug } -> Set { tn; idcs; llsc = loop_scalar llsc; debug }
     | Set_from_vec { tn; idcs; length; vec_unop; arg; debug } ->
-        Set_from_vec { tn; idcs; length; vec_unop; arg = loop_float arg; debug }
-    | Set_local (id, llsc) -> Set_local (id, loop_float llsc)
+        Set_from_vec { tn; idcs; length; vec_unop; arg = loop_scalar arg; debug }
+    | Set_local (id, llsc) -> Set_local (id, loop_scalar llsc)
     | Comment _ -> llc
     | Staged_compilation _ -> llc
-  and loop_float (llsc : scalar_t) : scalar_t =
+  and loop_scalar (llsc : scalar_t) : scalar_t =
     let local_scope_body, llsc' =
       match llsc with
       | Local_scope opts ->
@@ -906,11 +941,12 @@ let simplify_llc llc =
     in
     match llsc' with
     | Constant _ -> llsc
+    | Constant_bits _ -> llsc
     | Get (_ptr, _indices) -> llsc
-    | Local_scope { id; body = Set_local (id2, v); _ } when equal_scope_id id id2 -> loop_float v
+    | Local_scope { id; body = Set_local (id2, v); _ } when equal_scope_id id id2 -> loop_scalar v
     | Local_scope { id; body = Seq (Set_local (id1, v1), Set_local (id2, v2)); _ }
       when equal_scope_id id id1 && equal_scope_id id id2 ->
-        loop_float @@ substitute_float ~var:(Get_local id) ~value:v1 v2
+        loop_scalar @@ substitute_float ~var:(Get_local id) ~value:v1 v2
     | Local_scope opts -> Local_scope { opts with body = loop_proc local_scope_body }
     | Get_local _ -> llsc
     | Get_merge_buffer (_, _) -> llsc
@@ -918,78 +954,78 @@ let simplify_llc llc =
     | Embed_index Sub_axis -> Constant 0.
     | Embed_index (Iterator _) -> llsc
     | Embed_index (Affine _) -> llsc (* Cannot simplify affine expressions to constants *)
-    | Binop (Arg1, llv1, _) -> loop_float llv1
-    | Binop (Arg2, _, llv2) -> loop_float llv2
+    | Binop (Arg1, llv1, _) -> loop_scalar llv1
+    | Binop (Arg2, _, llv2) -> loop_scalar llv2
     | Binop (Threefry4x32, _, _) -> llsc
     | Binop (op, Constant c1, Constant c2) -> Constant (Ops.interpret_binop op c1 c2)
     | Binop (Add, llsc, Constant 0.)
     | Binop (Sub, llsc, Constant 0.)
     | Binop (Add, Constant 0., llsc) ->
-        loop_float llsc
-    | Binop (Sub, Constant 0., llsc) -> loop_float @@ Binop (Mul, Constant (-1.), llsc)
+        loop_scalar llsc
+    | Binop (Sub, Constant 0., llsc) -> loop_scalar @@ Binop (Mul, Constant (-1.), llsc)
     | Binop (Mul, llsc, Constant 1.)
     | Binop (Div, llsc, Constant 1.)
     | Binop (Mul, Constant 1., llsc) ->
-        loop_float llsc
+        loop_scalar llsc
     | Binop (Mul, _, Constant 0.) | Binop (Div, Constant 0., _) | Binop (Mul, Constant 0., _) ->
         Constant 0.
     | Binop (Add, (Binop (Add, Constant c2, llsc) | Binop (Add, llsc, Constant c2)), Constant c1)
     | Binop (Add, Constant c1, (Binop (Add, Constant c2, llsc) | Binop (Add, llsc, Constant c2))) ->
-        loop_float @@ Binop (Add, Constant (c1 +. c2), llsc)
+        loop_scalar @@ Binop (Add, Constant (c1 +. c2), llsc)
     | Binop (Sub, (Binop (Add, Constant c2, llsc) | Binop (Add, llsc, Constant c2)), Constant c1) ->
-        loop_float @@ Binop (Add, Constant (c2 -. c1), llsc)
+        loop_scalar @@ Binop (Add, Constant (c2 -. c1), llsc)
     | Binop (Sub, Constant c1, (Binop (Add, Constant c2, llsc) | Binop (Add, llsc, Constant c2))) ->
-        loop_float @@ Binop (Sub, Constant (c1 -. c2), llsc)
+        loop_scalar @@ Binop (Sub, Constant (c1 -. c2), llsc)
     | Binop (Add, llv1, Binop (Sub, llv2, llv3)) | Binop (Add, Binop (Sub, llv2, llv3), llv1) ->
-        loop_float @@ Binop (Sub, Binop (Add, llv1, llv2), llv3)
+        loop_scalar @@ Binop (Sub, Binop (Add, llv1, llv2), llv3)
     | Binop (Sub, llv1, Binop (Sub, llv2, llv3)) ->
-        loop_float @@ Binop (Sub, Binop (Add, llv1, llv3), llv2)
+        loop_scalar @@ Binop (Sub, Binop (Add, llv1, llv3), llv2)
     | Binop (Sub, Binop (Sub, llv1, llv2), llv3) ->
-        loop_float @@ Binop (Sub, llv1, Binop (Add, llv2, llv3))
+        loop_scalar @@ Binop (Sub, llv1, Binop (Add, llv2, llv3))
     | Binop (Mul, (Binop (Mul, Constant c2, llsc) | Binop (Mul, llsc, Constant c2)), Constant c1)
     | Binop (Mul, Constant c1, (Binop (Mul, Constant c2, llsc) | Binop (Mul, llsc, Constant c2))) ->
-        loop_float @@ Binop (Mul, Constant (c1 *. c2), llsc)
+        loop_scalar @@ Binop (Mul, Constant (c1 *. c2), llsc)
     | Binop (Div, (Binop (Mul, Constant c2, llsc) | Binop (Mul, llsc, Constant c2)), Constant c1) ->
-        loop_float @@ Binop (Mul, Constant (c2 /. c1), llsc)
+        loop_scalar @@ Binop (Mul, Constant (c2 /. c1), llsc)
     | Binop (Div, Constant c1, (Binop (Mul, Constant c2, llsc) | Binop (Mul, llsc, Constant c2))) ->
         (* TODO: this might worsen the conditioning in hand-designed formula cases. *)
-        loop_float @@ Binop (Div, Constant (c1 /. c2), llsc)
+        loop_scalar @@ Binop (Div, Constant (c1 /. c2), llsc)
     | Binop (Mul, llv1, Binop (Div, llv2, llv3)) | Binop (Mul, Binop (Div, llv2, llv3), llv1) ->
-        loop_float @@ Binop (Div, Binop (Mul, llv1, llv2), llv3)
+        loop_scalar @@ Binop (Div, Binop (Mul, llv1, llv2), llv3)
     | Binop (Div, llv1, Binop (Div, llv2, llv3)) ->
-        loop_float @@ Binop (Div, Binop (Mul, llv1, llv3), llv2)
+        loop_scalar @@ Binop (Div, Binop (Mul, llv1, llv3), llv2)
     | Binop (Div, Binop (Div, llv1, llv2), llv3) ->
-        loop_float @@ Binop (Div, llv1, Binop (Mul, llv2, llv3))
+        loop_scalar @@ Binop (Div, llv1, Binop (Mul, llv2, llv3))
     | Binop (ToPowOf, llv1, llv2) -> (
-        let v1 : scalar_t = loop_float llv1 in
-        let v2 : scalar_t = loop_float llv2 in
+        let v1 : scalar_t = loop_scalar llv1 in
+        let v2 : scalar_t = loop_scalar llv2 in
         let result : scalar_t = Binop (ToPowOf, v1, v2) in
         if not !optimize_integer_pow then result
         else
           match v2 with
           | Constant c when Float.is_integer c ->
-              loop_float @@ unroll_pow ~base:v1 ~exp:(Float.to_int c)
+              loop_scalar @@ unroll_pow ~base:v1 ~exp:(Float.to_int c)
           | _ -> result)
     | Binop (Add, Binop (Mul, llv1, llv2), llv3) | Binop (Add, llv3, Binop (Mul, llv1, llv2)) ->
         (* TODO: this is tentative. *)
-        loop_float @@ Ternop (FMA, llv1, llv2, llv3)
+        loop_scalar @@ Ternop (FMA, llv1, llv2, llv3)
     | Binop (op, llv1, llv2) ->
-        let v1 = loop_float llv1 in
-        let v2 = loop_float llv2 in
+        let v1 = loop_scalar llv1 in
+        let v2 = loop_scalar llv2 in
         let result = Binop (op, v1, v2) in
-        if equal_scalar_t llv1 v1 && equal_scalar_t llv2 v2 then result else loop_float result
+        if equal_scalar_t llv1 v1 && equal_scalar_t llv2 v2 then result else loop_scalar result
     | Ternop (op, llv1, llv2, llv3) ->
-        let v1 = loop_float llv1 in
-        let v2 = loop_float llv2 in
-        let v3 = loop_float llv3 in
+        let v1 = loop_scalar llv1 in
+        let v2 = loop_scalar llv2 in
+        let v3 = loop_scalar llv3 in
         let result = Ternop (op, v1, v2, v3) in
-        if equal_scalar_t llv1 v1 && equal_scalar_t llv2 v2 then result else loop_float result
-    | Unop (Identity, llsc) -> loop_float llsc
+        if equal_scalar_t llv1 v1 && equal_scalar_t llv2 v2 then result else loop_scalar result
+    | Unop (Identity, llsc) -> loop_scalar llsc
     | Unop (op, Constant c) -> Constant (Ops.interpret_unop op c)
     | Unop (op, llsc) ->
-        let v = loop_float llsc in
+        let v = loop_scalar llsc in
         let result = Unop (op, v) in
-        if equal_scalar_t llsc v then result else loop_float result
+        if equal_scalar_t llsc v then result else loop_scalar result
   in
   let check_constant tn c =
     (* Prevent triggering over-eager guard against forcing precision. *)
@@ -1017,6 +1053,7 @@ let simplify_llc llc =
     let loop = check_float tn in
     match llsc with
     | Constant c -> check_constant tn c
+    | Constant_bits _ -> () (* No check needed for bit constants *)
     | Local_scope { body; _ } -> check_proc body
     | Ternop (_, v1, v2, v3) ->
         loop v1;
@@ -1116,14 +1153,14 @@ let get_ident_within_code ?no_dots ?(blacklist = []) llcs =
     | Zero_out la -> visit la
     | Set { tn; llsc; _ } ->
         visit tn;
-        loop_float llsc
+        loop_scalar llsc
     | Set_from_vec { tn; arg; _ } ->
         visit tn;
-        loop_float arg
+        loop_scalar arg
     | Set_local ({ tn; _ }, llsc) ->
         visit tn;
-        loop_float llsc
-  and loop_float fc =
+        loop_scalar llsc
+  and loop_scalar fc =
     match fc with
     | Local_scope { id = { tn; _ }; body; orig_indices = _ } ->
         visit tn;
@@ -1131,15 +1168,15 @@ let get_ident_within_code ?no_dots ?(blacklist = []) llcs =
     | Get_merge_buffer (la, _) -> visit la
     | Get (la, _) -> visit la
     | Ternop (_, f1, f2, f3) ->
-        loop_float f1;
-        loop_float f2;
-        loop_float f3
+        loop_scalar f1;
+        loop_scalar f2;
+        loop_scalar f3
     | Binop (_, f1, f2) ->
-        loop_float f1;
-        loop_float f2
-    | Unop (_, f) -> loop_float f
+        loop_scalar f1;
+        loop_scalar f2
+    | Unop (_, f) -> loop_scalar f
     | Get_local { tn; _ } -> visit tn
-    | Constant _ | Embed_index _ -> ()
+    | Constant _ | Constant_bits _ | Embed_index _ -> ()
   in
   Array.iter ~f:loop llcs;
   let repeating_nograd_idents =
@@ -1229,6 +1266,7 @@ let to_doc_cstyle ?name ?static_indices () llc =
         group (doc_ident source ^^ string ".merge" ^^ brackets (pp_indices idcs))
     | Get (tn, idcs) -> group (doc_ident tn ^^ brackets (pp_indices idcs))
     | Constant c -> string (Printf.sprintf "%.16g" c)
+    | Constant_bits i -> string (Printf.sprintf "0x%LX" i)
     | Embed_index idx ->
         let idx_doc = pp_axis_index idx in
         if PPrint.is_empty idx_doc then string "0" else idx_doc
@@ -1320,6 +1358,7 @@ let to_doc ?name ?static_indices () llc =
         group (doc_ident source ^^ string ".merge" ^^ brackets (pp_indices idcs))
     | Get (tn, idcs) -> group (doc_ident tn ^^ brackets (pp_indices idcs))
     | Constant c -> string (Printf.sprintf "%.16g" c)
+    | Constant_bits i -> string (Printf.sprintf "0x%LX" i)
     | Embed_index idx ->
         let idx_doc = pp_axis_index idx in
         if PPrint.is_empty idx_doc then string "0" else idx_doc

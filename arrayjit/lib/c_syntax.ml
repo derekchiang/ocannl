@@ -71,6 +71,16 @@ module type C_syntax_config = sig
         implementation should handle quoting [base_message_literal], choosing the log function
         (printf, fprintf, os_log), and prepending any necessary prefixes (like a log_id or
         captured_log_prefix) to the format string and arguments. *)
+
+  val local_heap_alloc :
+    (zero_initialized:bool ->
+    num_elems:int ->
+    typ_doc:PPrint.document ->
+    ident_doc:PPrint.document ->
+    PPrint.document)
+    option
+
+  val local_heap_dealloc : (ident_doc:PPrint.document -> PPrint.document) option
 end
 
 module Pure_C_config (Input : sig
@@ -282,7 +292,8 @@ struct
         | _ -> invalid_arg "Pure_C_config.binop_syntax: Threefry4x32 on non-uint4x32 precision")
     | Ops.Satur01_gate -> (
         match prec with
-        | Ops.Byte_prec _ | Ops.Uint16_prec _ | Ops.Int32_prec _ | Ops.Uint4x32_prec _ ->
+        | Ops.Byte_prec _ | Ops.Uint16_prec _ | Ops.Int32_prec _ | Ops.Int64_prec _
+        | Ops.Uint4x32_prec _ ->
             let open PPrint in
             group
               (parens
@@ -455,6 +466,30 @@ struct
     ^^ (if List.is_empty args_docs then empty else comma ^^ space)
     ^^ separate (comma ^^ space) args_docs
     ^^ rparen ^^ semi
+
+  let local_heap_alloc ~zero_initialized ~num_elems ~typ_doc ~ident_doc =
+    let open PPrint in
+    let alloc_expr =
+      if zero_initialized then
+        string "calloc"
+        ^^ parens (OCaml.int num_elems ^^ comma ^^ space ^^ string "sizeof" ^^ parens typ_doc)
+      else
+        string "malloc"
+        ^^ parens
+             (OCaml.int num_elems ^^ space ^^ string "*" ^^ space ^^ string "sizeof"
+            ^^ parens typ_doc)
+    in
+    typ_doc ^^ space ^^ string "*" ^^ ident_doc ^^ space ^^ equals ^^ space
+    ^^ parens (typ_doc ^^ string "*")
+    ^^ alloc_expr
+
+  let local_heap_alloc = Some local_heap_alloc
+
+  let local_heap_dealloc ~ident_doc =
+    let open PPrint in
+    string "free(" ^^ ident_doc ^^ string ")"
+
+  let local_heap_dealloc = Some local_heap_dealloc
 end
 
 module C_syntax (B : C_syntax_config) = struct
@@ -495,6 +530,15 @@ module C_syntax (B : C_syntax_config) = struct
     let extras = separate hardline (List.map B.extra_declarations ~f:string) in
     includes ^^ hardline ^^ extras ^^ hardline
 
+  let pp_local_defs (local_defs : (int * PPrint.document) list) =
+    let open PPrint in
+    List.dedup_and_sort local_defs ~compare:(fun (a, _) (b, _) -> Int.compare a b)
+    |> List.map ~f:snd |> separate hardline
+
+  let pp_scope_id Low_level.{ scope_id; tn } =
+    let open PPrint in
+    string ("v" ^ Int.to_string scope_id ^ "_" ^ get_ident tn)
+
   let rec pp_ll (c : Low_level.t) : PPrint.document =
     let open PPrint in
     match c with
@@ -529,7 +573,8 @@ module C_syntax (B : C_syntax_config) = struct
         let ident_doc = string (get_ident tn) in
         let dims = Lazy.force tn.dims in
         let prec = Lazy.force tn.prec in
-        let local_defs, val_doc = pp_float prec llsc in
+        let local_defs, val_doc = pp_scalar prec llsc in
+        let local_defs = pp_local_defs local_defs in
         let offset_doc = pp_array_offset (idcs, dims) in
         let assignment =
           group
@@ -581,7 +626,9 @@ module C_syntax (B : C_syntax_config) = struct
           in
           lbrace ^^ nest 2 (hardline ^^ block_content) ^^ hardline ^^ rbrace
         else if PPrint.is_empty local_defs then assignment
-        else local_defs ^^ hardline ^^ assignment
+        else
+          let block_content = local_defs ^^ hardline ^^ assignment in
+          lbrace ^^ nest 2 (hardline ^^ block_content) ^^ hardline ^^ rbrace
     | Comment message ->
         if Utils.debug_log_from_routines () then
           let base_message = "COMMENT: " ^ message ^ "\n" in
@@ -595,7 +642,8 @@ module C_syntax (B : C_syntax_config) = struct
         let dims = Lazy.force tn.dims in
         let prec = Lazy.force tn.prec in
         let arg_prec = Ops.uint4x32 in
-        let local_defs, arg_doc = pp_float arg_prec arg in
+        let local_defs, arg_doc = pp_scalar arg_prec arg in
+        let local_defs = pp_local_defs local_defs in
         (* Generate the function call *)
         let result_doc = B.vec_unop_syntax prec vec_unop arg_doc in
         (* Generate assignments for each output element *)
@@ -669,19 +717,25 @@ module C_syntax (B : C_syntax_config) = struct
           in
           lbrace ^^ nest 2 (hardline ^^ block_content) ^^ hardline ^^ rbrace
         else if PPrint.is_empty local_defs then assignments
-        else local_defs ^^ hardline ^^ assignments
-    | Set_local ({ scope_id; tn = { prec; _ } }, value) ->
-        let local_defs, value_doc = pp_float (Lazy.force prec) value in
-        let assignment =
-          string ("v" ^ Int.to_string scope_id) ^^ string " = " ^^ value_doc ^^ semi
-        in
-        if PPrint.is_empty local_defs then assignment else local_defs ^^ hardline ^^ assignment
+        else
+          let block_content = local_defs ^^ hardline ^^ assignments in
+          lbrace ^^ nest 2 (hardline ^^ block_content) ^^ hardline ^^ rbrace
+    | Set_local (({ tn = { prec; _ }; _ } as id), value) ->
+        let local_defs, value_doc = pp_scalar (Lazy.force prec) value in
+        let local_defs = pp_local_defs local_defs in
+        let assignment = pp_scope_id id ^^ string " = " ^^ value_doc ^^ semi in
+        if PPrint.is_empty local_defs then assignment
+        else
+          let block_content = local_defs ^^ hardline ^^ assignment in
+          lbrace ^^ nest 2 (hardline ^^ block_content) ^^ hardline ^^ rbrace
 
-  and pp_float (prec : Ops.prec) (vcomp : Low_level.scalar_t) : PPrint.document * PPrint.document =
+  and pp_scalar (prec : Ops.prec) (vcomp : Low_level.scalar_t) :
+      (int * PPrint.document) list * PPrint.document =
     (* Returns (local definitions, value expression) *)
     let open PPrint in
     match vcomp with
-    | Local_scope { id = { scope_id; tn = { prec = scope_prec; _ } }; body; orig_indices = _ } ->
+    | Local_scope { id = { tn = { prec = scope_prec; _ }; scope_id } as id; body; orig_indices = _ }
+      ->
         let scope_prec = Lazy.force scope_prec in
         let num_typ = string (B.typ_of_prec scope_prec) in
         let init_zero =
@@ -689,17 +743,17 @@ module C_syntax (B : C_syntax_config) = struct
           let prefix, postfix = B.convert_precision ~from:Ops.int32 ~to_:scope_prec in
           string " = " ^^ string prefix ^^ string "0" ^^ string postfix
         in
-        let decl = num_typ ^^ space ^^ string ("v" ^ Int.to_string scope_id) ^^ init_zero ^^ semi in
+        let decl = num_typ ^^ space ^^ pp_scope_id id ^^ init_zero ^^ semi in
         let body_doc = pp_ll body in
-        let defs = decl ^^ hardline ^^ body_doc in
+        let def_doc = decl ^^ hardline ^^ body_doc in
         let prefix, postfix = B.convert_precision ~from:scope_prec ~to_:prec in
-        let expr = string prefix ^^ string ("v" ^ Int.to_string scope_id) ^^ string postfix in
-        (defs, expr)
+        let expr = string prefix ^^ pp_scope_id id ^^ string postfix in
+        ([ (scope_id, def_doc) ], expr)
     | Get_local id ->
         let scope_prec = Lazy.force id.tn.prec in
         let prefix, postfix = B.convert_precision ~from:scope_prec ~to_:prec in
-        let expr = string prefix ^^ string ("v" ^ Int.to_string id.scope_id) ^^ string postfix in
-        (empty, expr)
+        let expr = string prefix ^^ pp_scope_id id ^^ string postfix in
+        ([], expr)
     | Get_merge_buffer (source, idcs) ->
         let tn = source in
         let dims = Lazy.force tn.dims in
@@ -709,7 +763,7 @@ module C_syntax (B : C_syntax_config) = struct
         let expr =
           string prefix ^^ string "merge_buffer" ^^ brackets offset_doc ^^ string postfix
         in
-        (empty, expr)
+        ([], expr)
     | Get (tn, idcs) ->
         let ident_doc = string (get_ident tn) in
         let dims = Lazy.force tn.dims in
@@ -717,7 +771,7 @@ module C_syntax (B : C_syntax_config) = struct
         let prefix, postfix = B.convert_precision ~from:from_prec ~to_:prec in
         let offset_doc = pp_array_offset (idcs, dims) in
         let expr = string prefix ^^ ident_doc ^^ brackets offset_doc ^^ string postfix in
-        (empty, expr)
+        ([], expr)
     | Constant c ->
         let from_prec = Ops.double in
         let prefix, postfix = B.convert_precision ~from:from_prec ~to_:prec in
@@ -727,37 +781,36 @@ module C_syntax (B : C_syntax_config) = struct
             string "(" ^^ string c_str ^^ string ")" ^^ string postfix
           else string prefix ^^ string c_str ^^ string postfix
         in
-        (empty, expr)
+        ([], expr)
+    | Constant_bits i ->
+        let from_prec = Ops.int64 in
+        let prefix, postfix = B.convert_precision ~from:from_prec ~to_:prec in
+        let expr = string prefix ^^ string (Printf.sprintf "%LdLL" i) ^^ string postfix in
+        ([], expr)
     | Embed_index idx ->
         let from_prec = Ops.int32 in
         let prefix, postfix = B.convert_precision ~from:from_prec ~to_:prec in
         let idx_doc = pp_axis_index idx in
         let idx_doc = if PPrint.is_empty idx_doc then string "0" else idx_doc in
         let expr = string prefix ^^ idx_doc ^^ string postfix in
-        (empty, expr)
-    | Binop (Arg1, v1, _v2) -> pp_float prec v1
-    | Binop (Arg2, _v1, v2) -> pp_float prec v2
+        ([], expr)
+    | Binop (Arg1, v1, _v2) -> pp_scalar prec v1
+    | Binop (Arg2, _v1, v2) -> pp_scalar prec v2
     | Ternop (op, v1, v2, v3) ->
-        let d1, e1 = pp_float prec v1 in
-        let d2, e2 = pp_float prec v2 in
-        let d3, e3 = pp_float prec v3 in
-        let defs =
-          List.filter_map [ d1; d2; d3 ] ~f:(fun d -> if PPrint.is_empty d then None else Some d)
-          |> separate hardline
-        in
+        let d1, e1 = pp_scalar prec v1 in
+        let d2, e2 = pp_scalar prec v2 in
+        let d3, e3 = pp_scalar prec v3 in
+        let defs = List.concat [ d1; d2; d3 ] in
         let expr = group (B.ternop_syntax prec op e1 e2 e3) in
         (defs, expr)
     | Binop (op, v1, v2) ->
-        let d1, e1 = pp_float prec v1 in
-        let d2, e2 = pp_float prec v2 in
-        let defs =
-          List.filter_map [ d1; d2 ] ~f:(fun d -> if PPrint.is_empty d then None else Some d)
-          |> separate hardline
-        in
+        let d1, e1 = pp_scalar prec v1 in
+        let d2, e2 = pp_scalar prec v2 in
+        let defs = List.concat [ d1; d2 ] in
         let expr = group (B.binop_syntax prec op e1 e2) in
         (defs, expr)
     | Unop (op, v) ->
-        let defs, expr_v = pp_float prec v in
+        let defs, expr_v = pp_scalar prec v in
         let expr = group (B.unop_syntax prec op expr_v) in
         (defs, expr)
 
@@ -774,7 +827,7 @@ module C_syntax (B : C_syntax_config) = struct
     | Get_local id ->
         let scope_prec = Lazy.force id.tn.prec in
         let prefix, postfix = B.convert_precision ~from:scope_prec ~to_:prec in
-        let v_doc = string prefix ^^ string ("v" ^ Int.to_string id.scope_id) ^^ string postfix in
+        let v_doc = string prefix ^^ pp_scope_id id ^^ string postfix in
         (v_doc ^^ braces (string ("=" ^ B.float_log_style)), [ `Value v_doc ])
     | Get_merge_buffer (source, idcs) ->
         let tn = source in
@@ -811,6 +864,11 @@ module C_syntax (B : C_syntax_config) = struct
         let prefix, postfix = B.convert_precision ~from:from_prec ~to_:prec in
         let c_str = Printf.sprintf "%.16g" c in
         (string prefix ^^ string c_str ^^ string postfix, [])
+    | Constant_bits i ->
+        let from_prec = Ops.int64 in
+        let prefix, postfix = B.convert_precision ~from:from_prec ~to_:prec in
+        let expr = string prefix ^^ string (Printf.sprintf "%LdLL" i) ^^ string postfix in
+        (expr, [])
     | Embed_index idx ->
         let idx_doc = pp_axis_index idx in
         ((if PPrint.is_empty idx_doc then string "0" else idx_doc), [])
@@ -937,6 +995,9 @@ module C_syntax (B : C_syntax_config) = struct
        body := !body ^^ debug_init_doc ^^ hardline);
 
     let heap_allocated = ref [] in
+    let stack_threshold_in_bytes =
+      Int.of_string @@ Utils.get_global_arg ~default:"16384" ~arg_name:"stack_threshold_in_bytes"
+    in
     let local_decls =
       string "/* Local declarations and initialization. */"
       ^^ hardline
@@ -947,27 +1008,18 @@ module C_syntax (B : C_syntax_config) = struct
                let ident_doc = string (get_ident tn) in
                let num_elems = Tn.num_elems tn in
                let size_doc = OCaml.int num_elems in
-               (* Use heap allocation for arrays larger than 16KB to avoid stack overflow in Domain
-                  threads *)
-               let stack_threshold = 16384 / (Ops.prec_in_bytes @@ Lazy.force tn.prec) in
-               if num_elems > stack_threshold then (
+               (* Use heap allocation for arrays larger than stack_threshold_in_bytes to avoid stack
+                  overflow in Domain threads *)
+
+               if
+                 Option.is_some B.local_heap_alloc && stack_threshold_in_bytes > 0
+                 && num_elems > stack_threshold_in_bytes / (Ops.prec_in_bytes @@ Lazy.force tn.prec)
+               then (
                  (* Heap allocation for large arrays *)
                  heap_allocated := get_ident tn :: !heap_allocated;
-                 let alloc_expr =
-                   if node.Low_level.zero_initialized then
-                     string "calloc"
-                     ^^ parens
-                          (OCaml.int num_elems ^^ comma ^^ space ^^ string "sizeof"
-                         ^^ parens typ_doc)
-                   else
-                     string "malloc"
-                     ^^ parens
-                          (OCaml.int num_elems ^^ space ^^ string "*" ^^ space ^^ string "sizeof"
-                         ^^ parens typ_doc)
-                 in
-                 typ_doc ^^ space ^^ string "*" ^^ ident_doc ^^ space ^^ equals ^^ space
-                 ^^ parens (typ_doc ^^ string "*")
-                 ^^ alloc_expr ^^ semi ^^ hardline)
+                 Option.value_exn B.local_heap_alloc
+                   ~zero_initialized:node.Low_level.zero_initialized ~num_elems ~typ_doc ~ident_doc
+                 ^^ semi ^^ hardline)
                else
                  (* Stack allocation for small arrays *)
                  let init_doc =
@@ -983,13 +1035,13 @@ module C_syntax (B : C_syntax_config) = struct
     body := !body ^^ main_logic;
 
     (* Free heap-allocated arrays *)
-    if not (List.is_empty !heap_allocated) then
+    if Option.is_some B.local_heap_dealloc && not (List.is_empty !heap_allocated) then
       body :=
         !body ^^ hardline
         ^^ string "/* Cleanup heap-allocated arrays. */"
         ^^ hardline
         ^^ separate_map hardline
-             (fun ident -> string "free" ^^ parens (string ident) ^^ semi)
+             (fun ident -> Option.value_exn B.local_heap_dealloc ~ident_doc:(string ident) ^^ semi)
              !heap_allocated
         ^^ hardline;
 

@@ -448,6 +448,7 @@ end) : Ir.Backend_impl.Lowered_backend = struct
       | Ops.Single_prec _ -> "float"
       | Ops.Double_prec _ ->
           raise @@ Utils.User_error "Metal backend does not support double precision"
+      | Ops.Int64_prec _ -> "long"
       | Ops.Void_prec -> "void"
 
     let vec_typ_of_prec ~length prec =
@@ -473,6 +474,7 @@ end) : Ir.Backend_impl.Lowered_backend = struct
       | Ops.Single_prec _ -> "f"
       | Ops.Double_prec _ ->
           raise @@ Utils.User_error "Metal backend does not support double precision"
+      | Ops.Int64_prec _ -> "l"
       | Ops.Void_prec -> ""
 
     let ternop_syntax _prec op =
@@ -620,6 +622,9 @@ end) : Ir.Backend_impl.Lowered_backend = struct
         string metal_log_object_name ^^ string ".log_debug(" ^^ base_doc ^^ comma ^^ space
         ^^ separate (comma ^^ space) args_docs
         ^^ rparen ^^ semi
+
+    let local_heap_alloc = None
+    let local_heap_dealloc = None
   end
 
   let%diagn_sexp compile_metal_source ~name ~source ~device =
@@ -700,8 +705,9 @@ end) : Ir.Backend_impl.Lowered_backend = struct
       traced_stores;
     }
 
-  let%diagn2_sexp link_proc ~prior_context ~library ~func_name ~params ~lowered_bindings ~ctx_arrays
-      =
+  let%debug4_sexp link_proc ~prior_context ~library ~func_name
+      ~(params : (string * param_source) list) ~lowered_bindings ~(ctx_arrays : buffer_ptr Tn.t_map)
+      : Task.t =
     let stream = prior_context.stream in
     let device = stream.device.dev in
     let queue = stream.runner.queue in

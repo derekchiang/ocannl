@@ -87,6 +87,9 @@ cc_backend_compiler_command=
 # are used for the dynamic libraries (default behavior).
 output_dlls_in_build_directory=false
 
+# Per-tensor-node cutoff in bytes for considering off-stack allocation, opt-in for backends.
+# Decrease it if you see crashes like `bus error`. Values smaller-or-equal 0 mean "no limits".
+stack_threshold_in_bytes=16384
 
 # Only tensor nodes with up to this many visits per array cell (in a dedicated interpreter)
 # can be inlined. Values worth considering: 0 (disables inlining) to 3.
@@ -101,8 +104,14 @@ enable_device_only=true
 # If true, scalar constant expressions will always be inlined.
 inline_scalar_constexprs=true
 
-# If true, if the tensor node is built from index embeddings and scalar constant expressions, regardless of accesses, it will be inlined.
+# If true, if the tensor node is built from either single getters, or index embeddings and
+# scalar constant expressions, regardless of accesses, it will be inlined.
 inline_simple_computations=true
+
+# If true, virtualize_max_visits only counts accesses that are not used for assignment of
+# the same cell (typically accumulation). Otherwise, all accesses are counted, so computations
+# that reduce an axis will rarely be inlined.
+inline_complex_computations=true
 
 # The random number library. Options: `stdlib` -- `Base.Random`;
 # `for_tests` -- simplistic randomness with 32 bit seed, focused on reproducibility.
@@ -175,6 +184,10 @@ debug_entry_id_pairs=
 # For ppx_minidebug: for generating file names. If empty, all logging will be done to stdout,
 # regardless of the value of `log_main_domain_to_stdout`.
 log_file_stem=debug
+
+# For ppx_minidebug: If given a number, sets the `truncate_children` parameter: only this number
+# of the most recent children of each log entry are held.`
+debug_log_truncate_children=
 
 # It is useful for testing to have outputs more uniform across backends even if that criples
 # some backends. Currently, this setting only affects logging from routines to accomodate Metal's

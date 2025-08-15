@@ -36,3 +36,12 @@
  (libraries ocannl datasets)
  (preprocess
   (pps ppx_here ppx_ocannl)))
+
+(test
+ (name makemore)
+ (package neural_nets_lib)
+ (modules makemore)
+ (deps ocannl_config ../../datasets/names.txt)
+ (libraries ocannl datasets)
+ (preprocess
+  (pps ppx_here ppx_ocannl)))

@@ -81,11 +81,22 @@ let () =
   let%op input = inputs @| batch_n in
   let%op output = outputs @| batch_n in
 
+  (* Train.printf ~here:[%here] ~with_code:false ~with_grad:false input; *)
+  let hid_dim = 100 in
   let%op mlp input =
     (* w1 is the embeddings *)
-    let ebs = TDSL.param ~output_dims:[ 27; embeddings_size ] "embeddings" () in
-    let input_ebs = input * ebs in
-    let logits = (tanh ((input_ebs * "w1" 100) + "b1") * "w2" 27) + "b2" in
+    (* For embeddings: we want to map from dict_size space to embeddings_size space
+       input has shape [context_size; dict_size] where dict_size is in output position
+       We need to reshape input to have dict_size in input position for multiplication *)
+    let ebs =
+      TDSL.param ~output_dims:[ Datasets.Names.dict_size; embeddings_size ] "embeddings" ()
+    in
+    (* Train.printf ~here:[%here] ~with_code:false ~with_grad:false ebs; *)
+    let input_ebs = input *+ "b|ij; b|jk => b|ik" ebs in
+    (* let first_layer = "w1" *+ "b|ik->g; b|ik => b|g" input_ebs *)
+    let logits =
+      "b2" Datasets.Names.dict_size + ("w2" * tanh ("b1" hid_dim + ("w1" * input_ebs)))
+    in
     let counts = exp logits in
     counts /. (counts ++ "...|... => ...|0")
   in

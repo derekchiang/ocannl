@@ -10,18 +10,25 @@ module type Backend = Ir.Backend_intf.Backend
 
 let _get_local_debug_runtime = Utils.get_local_debug_runtime
 
-[%%global_debug_log_level 9]
-[%%global_debug_log_level_from_env_var "OCANNL_LOG_LEVEL"]
+[%%global_debug_log_level 0]
+
+(* export OCANNL_LOG_LEVEL_PRIMITIVE_OPS=9 to enable debugging into the log_files/ directory. *)
+[%%global_debug_log_level_from_env_var "OCANNL_LOG_LEVEL_PRIMITIVE_OPS"]
 
 let graph_t () : unit =
   Tensor.unsafe_reinitialize ();
   let module Backend = (val Backends.fresh_backend ()) in
   let open Operation.At in
   CDSL.virtualize_settings.enable_device_only <- false;
+  let%op f x = where (x < !.0.) (sin x) (cos x) in
   (* let%op f x = sin x in *)
-  let%op f x = sin x in
-  let size = 50 in
-  let xs = Array.init size ~f:Float.(fun i -> (of_int i / 10.) + 0.1) in
+  (* let%op f x = sin x in *)
+  let size = 10 in
+  let x_min = -5. in
+  let x_max = 5. in
+  let xs =
+    Array.init size ~f:Float.(fun i -> x_min + (of_int i * (x_max - x_min) / (of_int size - 1.)))
+  in
   let x_flat = Tensor.term_init xs ~label:[ "x_flat" ] ~grad_spec:Require_grad () in
   let step_sym, bindings = IDX.get_static_symbol ~static_range:size IDX.empty in
   let%op xkcd = x_flat @| step_sym in
@@ -29,6 +36,7 @@ let graph_t () : unit =
   Train.set_hosted xkcd.value;
   Train.set_hosted x_flat.value;
   Train.set_hosted (Option.value_exn ~here:[%here] xkcd.diff).grad;
+  (* There actually are no params! Stress test the empty comp case. *)
   let ctx = Train.init_params (module Backend) IDX.empty fx in
   let update = Train.grad_update fx in
   let fx_routine = Train.to_routine (module Backend) ctx bindings update in

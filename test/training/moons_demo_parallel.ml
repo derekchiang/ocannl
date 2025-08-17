@@ -8,7 +8,7 @@ module CDSL = Train.CDSL
 
 let main () =
   (* Micrograd half-moons example, with multi-stream execution simulating multi-device. *)
-  let seed = 18 in
+  let seed = 6 in
   Utils.settings.fixed_state_for_init <- Some seed;
   Tensor.unsafe_reinitialize ();
   let hid_dim = 16 in
@@ -20,7 +20,7 @@ let main () =
   let len = batch_size * 20 in
   let init_lr = 0.1 in
   (* let epochs = 10 in *)
-  let epochs = 80 in
+  let epochs = 120 in
   (* let epochs = 1 in *)
   let moons_config = Datasets.Half_moons.Config.{ noise_range = 0.1; seed = Some seed } in
   let moons_coordinates, moons_labels =
@@ -40,7 +40,12 @@ let main () =
   let module Backend = (val Backends.fresh_backend ()) in
   let per_batch_callback ~at_batch:_ ~at_step:_ ~learning_rate:_ ~batch_loss:_ ~epoch_loss:_ = () in
   (* Tn.print_accessible_headers (); *)
-  let per_epoch_callback ~at_step:_ ~at_epoch:_ ~learning_rate:_ ~epoch_loss:_ = () in
+  let per_epoch_callback ~at_step:_ ~at_epoch ~learning_rate ~epoch_loss =
+    if at_epoch = epochs - 5 then Stdio.printf "\n%!"; 
+    if at_epoch < 10 then
+      Stdio.printf "Epoch=%d, lr=%f, loss=%.5g\n%!" at_epoch learning_rate epoch_loss;
+    if at_epoch > 10 && at_epoch % 10 = 0 then Stdio.printf ".%!";
+  in
   let {
     Train.inputs;
     outputs;
@@ -58,25 +63,25 @@ let main () =
       ()
   in
   let epoch_loss = List.hd_exn rev_epoch_losses in
-  Stdio.printf "Epoch loss: %f\n%!" epoch_loss;
+  Stdio.printf "Epoch loss: %.3f\n%!" epoch_loss;
   (* if Float.(epoch_loss < 1.5) then Stdio.printf "Success\n" else *)
   let points = Tn.points_2d ~xdim:0 ~ydim:1 inputs.value in
   let classes = Tn.points_1d ~xdim:0 outputs.value in
   let points1, points2 = Array.partitioni_tf points ~f:Float.(fun i _ -> classes.(i) > 0.) in
   let callback (x, y) = Float.((infer_callback [| x; y |]).(0) >= 0.) in
-  let plot_moons =
+  let _plot_moons =
     PrintBox_utils.plot ~as_canvas:true
       [
-        PrintBox_ext_plot.Scatterplot { points = points1; content = PrintBox.line "#" };
+        Scatterplot { points = points1; content = PrintBox.line "#" };
         Scatterplot { points = points2; content = PrintBox.line "%" };
         Boundary_map
           { content_false = PrintBox.line "."; content_true = PrintBox.line "*"; callback };
       ]
   in
-  Stdio.printf "\nHalf-moons scatterplot and decision boundary:\n";
-  PrintBox_text.output Stdio.stdout plot_moons;
-  Stdio.printf "\nBatch Log-loss:\n%!";
-  let plot_loss =
+  (* Stdio.printf "\nHalf-moons scatterplot and decision boundary:\n"; *)
+  (* PrintBox_text.output Stdio.stdout plot_moons; *)
+  (* Stdio.printf "\nBatch Log-loss:\n%!"; *)
+  let _plot_loss =
     PrintBox_utils.plot ~x_label:"step" ~y_label:"batch log loss"
       [
         Line_plot
@@ -87,14 +92,14 @@ let main () =
           };
       ]
   in
-  PrintBox_text.output Stdio.stdout plot_loss;
-  Stdio.printf "\nEpoch Log-loss:\n%!";
+  (* PrintBox_text.output Stdio.stdout plot_loss; *)
+  Stdio.printf "\nEpoch loss:\n%!";
   let plot_loss =
-    PrintBox_utils.plot ~x_label:"step" ~y_label:"epoch log loss"
+    PrintBox_utils.plot ~x_label:"step" ~y_label:"epoch loss" ~small:true
       [
         Line_plot
           {
-            points = Array.of_list_rev_map rev_epoch_losses ~f:Float.log;
+            points = Array.of_list_rev rev_epoch_losses;
             content = PrintBox.line "-";
           };
       ]

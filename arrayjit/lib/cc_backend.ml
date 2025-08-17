@@ -4,8 +4,10 @@ open Ir
 
 let _get_local_debug_runtime = Utils.get_local_debug_runtime
 
-[%%global_debug_log_level 9]
-[%%global_debug_log_level_from_env_var "OCANNL_LOG_LEVEL"]
+[%%global_debug_log_level 0]
+
+(* export OCANNL_LOG_LEVEL_CC_BACKEND=9 to enable debugging into the log_files/ directory. *)
+[%%global_debug_log_level_from_env_var "OCANNL_LOG_LEVEL_CC_BACKEND"]
 
 include Backend_impl.No_device_buffer_and_copying ()
 open Backend_intf
@@ -136,7 +138,12 @@ let%track7_sexp c_compile_and_load ~f_path =
   let rc : int = Stdlib.Sys.command cmdline in
   (* Note: it seems waiting for the file to exist is necessary here and below regardless of needing
      the logs. *)
+  let start_time = Unix.gettimeofday () in
+  let timeout = 1.0 in
   while rc = 0 && (not @@ (Stdlib.Sys.file_exists libname && Stdlib.Sys.file_exists log_fname)) do
+    let elapsed = Unix.gettimeofday () -. start_time in
+    if Float.(elapsed > timeout) then
+      failwith "Cc_backend.c_compile_and_load: timeout waiting for compilation files to appear";
     Unix.sleepf 0.001
   done;
   if rc <> 0 then (
@@ -151,9 +158,14 @@ let%track7_sexp c_compile_and_load ~f_path =
   let rc =
     Stdlib.Sys.command @@ Printf.sprintf "codesign -s - %s >> %s 2>&1" libname sign_log_fname
   in
+  let start_time_sign = Unix.gettimeofday () in
+  let timeout_sign = 1.0 in
   while
     rc = 0 && (not @@ (Stdlib.Sys.file_exists libname && Stdlib.Sys.file_exists sign_log_fname))
   do
+    let elapsed_sign = Unix.gettimeofday () -. start_time_sign in
+    if Float.(elapsed_sign > timeout_sign) then
+      failwith "Cc_backend.c_compile_and_load: timeout waiting for codesign files to appear";
     Unix.sleepf 0.001
   done;
   let verify_codesign =

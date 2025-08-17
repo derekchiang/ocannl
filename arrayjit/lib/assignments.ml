@@ -7,8 +7,10 @@ module Nd = Ndarray
 
 let _get_local_debug_runtime = Utils.get_local_debug_runtime
 
-[%%global_debug_log_level 9]
-[%%global_debug_log_level_from_env_var "OCANNL_LOG_LEVEL"]
+[%%global_debug_log_level 0]
+
+(* export OCANNL_LOG_LEVEL_ASSIGNMENTS=9 to enable debugging into the log_files/ directory. *)
+[%%global_debug_log_level_from_env_var "OCANNL_LOG_LEVEL_ASSIGNMENTS"]
 
 type init_data =
   | Reshape of Ndarray.t
@@ -77,23 +79,6 @@ type comp = {
 
 let to_comp asgns = { asgns; embedded_nodes = Set.empty (module Tnode) }
 let empty_comp = to_comp Noop
-
-let get_name_exn asgns =
-  let punct_or_sp = Str.regexp "[-@*/:.;, ]" in
-  let punct_and_sp = Str.regexp {|[-@*/:.;,]\( |$\)|} in
-  let rec loop = function
-    | Block_comment (s, _) ->
-        Str.global_replace punct_and_sp "" s |> Str.global_replace punct_or_sp "_"
-    | Seq (t1, t2) ->
-        let n1 = loop t1 and n2 = loop t2 in
-        let prefix = String.common_prefix2_length n1 n2 in
-        let suffix = String.common_suffix2_length n1 n2 in
-        if String.is_empty n1 || String.is_empty n2 then n1 ^ n2
-        else String.drop_suffix n1 suffix ^ "_then_" ^ String.drop_prefix n2 prefix
-    | _ -> ""
-  in
-  let result = loop asgns in
-  if String.is_empty result then invalid_arg "Assignments.get_name: no comments in code" else result
 
 let is_total ~initialize_neutral ~projections =
   initialize_neutral && Indexing.is_surjective projections
@@ -247,14 +232,14 @@ let%track4_sexp to_low_level code =
             }
     in
     let for_loops = for_loop [] (Array.to_list projections.product_space) in
-    (* Need initialization if:
-       - initialize_neutral is true AND
-       - (not surjective OR not injective)
+    (* Need initialization if: initialize_neutral is true AND (not surjective OR not injective)
+
        Not surjective: some positions never written (need init to avoid garbage)
+
        Not injective: accumulation needed (need init for first += operation) *)
-    let needs_init = 
-      initialize_neutral && 
-      not (Indexing.is_surjective projections && Indexing.is_injective projections)
+    let needs_init =
+      initialize_neutral
+      && not (Indexing.is_surjective projections && Indexing.is_injective projections)
     in
     if needs_init then
       let dims = lazy projections.lhs_dims in
@@ -341,7 +326,8 @@ let%track4_sexp to_low_level code =
     | Fetch { array; fetch_op = Constant c; dims } ->
         Low_level.loop_over_dims (Lazy.force dims) ~body:(fun idcs -> set array idcs @@ Constant c)
     | Fetch { array; fetch_op = Constant_bits i; dims } ->
-        Low_level.loop_over_dims (Lazy.force dims) ~body:(fun idcs -> set array idcs @@ Constant_bits i)
+        Low_level.loop_over_dims (Lazy.force dims) ~body:(fun idcs ->
+            set array idcs @@ Constant_bits i)
     | Fetch { array; fetch_op = Slice { batch_idx = { static_symbol = idx; _ }; sliced }; dims } ->
         (* TODO: doublecheck this always gets optimized away. *)
         Low_level.loop_over_dims (Lazy.force dims) ~body:(fun idcs ->
@@ -532,6 +518,31 @@ let to_doc ?name ?static_indices () c =
   in
 
   header_doc ^^ nest 2 (doc_of_code c)
+
+let to_string c =
+  let doc = to_doc () c in
+  let b = Buffer.create 100 in
+  PPrint.ToBuffer.pretty 0.7 100 b doc;
+  Buffer.contents b
+
+let get_name_exn asgns =
+  let punct_or_sp = Str.regexp "[-@*/:.;, ]" in
+  let punct_and_sp = Str.regexp {|[-@*/:.;,]\( |$\)|} in
+  let rec loop = function
+    | Block_comment (s, _) ->
+        Str.global_replace punct_and_sp "" s |> Str.global_replace punct_or_sp "_"
+    | Seq (t1, t2) ->
+        let n1 = loop t1 and n2 = loop t2 in
+        let prefix = String.common_prefix2_length n1 n2 in
+        let suffix = String.common_suffix2_length n1 n2 in
+        if String.is_empty n1 || String.is_empty n2 then n1 ^ n2
+        else String.drop_suffix n1 suffix ^ "_then_" ^ String.drop_prefix n2 prefix
+    | _ -> ""
+  in
+  let result = loop asgns in
+  if String.is_empty result then
+    invalid_arg "Assignments.get_name_exn: no comments in code: " ^ to_string asgns
+  else result
 
 let%track6_sexp lower optim_ctx ~unoptim_ll_source ~ll_source ~cd_source ~name static_indices
     (proc : t) : Low_level.optimized =

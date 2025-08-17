@@ -8,8 +8,10 @@ module Impl = Backend_impl (* Alias for Backend_impl *)
 
 let _get_local_debug_runtime = Utils.get_local_debug_runtime
 
-[%%global_debug_log_level 9]
-[%%global_debug_log_level_from_env_var "OCANNL_LOG_LEVEL"]
+[%%global_debug_log_level 0]
+
+(* export OCANNL_LOG_LEVEL_METAL_BACKEND=9 to enable debugging into the log_files/ directory. *)
+[%%global_debug_log_level_from_env_var "OCANNL_LOG_LEVEL_METAL_BACKEND"]
 
 type ullong = Unsigned.ULLong.t
 
@@ -622,9 +624,6 @@ end) : Ir.Backend_impl.Lowered_backend = struct
         string metal_log_object_name ^^ string ".log_debug(" ^^ base_doc ^^ comma ^^ space
         ^^ separate (comma ^^ space) args_docs
         ^^ rparen ^^ semi
-
-    let local_heap_alloc = None
-    let local_heap_dealloc = None
   end
 
   let%diagn_sexp compile_metal_source ~name ~source ~device =

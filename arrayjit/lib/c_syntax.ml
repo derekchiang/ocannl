@@ -4,8 +4,10 @@ open Backend_intf
 
 let _get_local_debug_runtime = Utils.get_local_debug_runtime
 
-[%%global_debug_log_level 9]
-[%%global_debug_log_level_from_env_var "OCANNL_LOG_LEVEL"]
+[%%global_debug_log_level 0]
+
+(* export OCANNL_LOG_LEVEL_C_SYNTAX=9 to enable debugging into the log_files/ directory. *)
+[%%global_debug_log_level_from_env_var "OCANNL_LOG_LEVEL_C_SYNTAX"]
 
 module Tn = Tnode
 
@@ -71,16 +73,6 @@ module type C_syntax_config = sig
         implementation should handle quoting [base_message_literal], choosing the log function
         (printf, fprintf, os_log), and prepending any necessary prefixes (like a log_id or
         captured_log_prefix) to the format string and arguments. *)
-
-  val local_heap_alloc :
-    (zero_initialized:bool ->
-    num_elems:int ->
-    typ_doc:PPrint.document ->
-    ident_doc:PPrint.document ->
-    PPrint.document)
-    option
-
-  val local_heap_dealloc : (ident_doc:PPrint.document -> PPrint.document) option
 end
 
 module Pure_C_config (Input : sig
@@ -466,30 +458,6 @@ struct
     ^^ (if List.is_empty args_docs then empty else comma ^^ space)
     ^^ separate (comma ^^ space) args_docs
     ^^ rparen ^^ semi
-
-  let local_heap_alloc ~zero_initialized ~num_elems ~typ_doc ~ident_doc =
-    let open PPrint in
-    let alloc_expr =
-      if zero_initialized then
-        string "calloc"
-        ^^ parens (OCaml.int num_elems ^^ comma ^^ space ^^ string "sizeof" ^^ parens typ_doc)
-      else
-        string "malloc"
-        ^^ parens
-             (OCaml.int num_elems ^^ space ^^ string "*" ^^ space ^^ string "sizeof"
-            ^^ parens typ_doc)
-    in
-    typ_doc ^^ space ^^ string "*" ^^ ident_doc ^^ space ^^ equals ^^ space
-    ^^ parens (typ_doc ^^ string "*")
-    ^^ alloc_expr
-
-  let local_heap_alloc = Some local_heap_alloc
-
-  let local_heap_dealloc ~ident_doc =
-    let open PPrint in
-    string "free(" ^^ ident_doc ^^ string ")"
-
-  let local_heap_dealloc = Some local_heap_dealloc
 end
 
 module C_syntax (B : C_syntax_config) = struct
@@ -647,11 +615,11 @@ module C_syntax (B : C_syntax_config) = struct
         (* Generate the function call *)
         let result_doc = B.vec_unop_syntax prec vec_unop arg_doc in
         (* Generate assignments for each output element *)
+        let open PPrint in
+        let vec_var = string "vec_result" in
+        let vec_typ = string (B.vec_typ_of_prec ~length prec) in
+        let vec_decl = vec_typ ^^ space ^^ vec_var ^^ string " = " ^^ result_doc ^^ semi in
         let assignments =
-          let open PPrint in
-          let vec_var = string "vec_result" in
-          let vec_typ = string (B.vec_typ_of_prec ~length prec) in
-          let vec_decl = vec_typ ^^ space ^^ vec_var ^^ string " = " ^^ result_doc ^^ semi in
           let elem_assigns =
             List.init length ~f:(fun i ->
                 let offset_doc =
@@ -669,7 +637,7 @@ module C_syntax (B : C_syntax_config) = struct
                 ^^ string (".v[" ^ Int.to_string i ^ "]")
                 ^^ semi)
           in
-          vec_decl ^^ hardline ^^ separate hardline elem_assigns
+          separate hardline elem_assigns
         in
         if Utils.debug_log_from_routines () then
           let open PPrint in
@@ -712,13 +680,15 @@ module C_syntax (B : C_syntax_config) = struct
             comment_log ^^ hardline ^^ separate hardline value_logs ^^ hardline ^^ flush_log
           in
           let block_content =
-            if PPrint.is_empty local_defs then assignments ^^ hardline ^^ log_docs
-            else local_defs ^^ hardline ^^ assignments ^^ hardline ^^ log_docs
+            if PPrint.is_empty local_defs then
+              vec_decl ^^ hardline ^^ log_docs ^^ hardline ^^ assignments
+            else
+              local_defs ^^ hardline ^^ vec_decl ^^ hardline ^^ log_docs ^^ hardline ^^ assignments
           in
           lbrace ^^ nest 2 (hardline ^^ block_content) ^^ hardline ^^ rbrace
-        else if PPrint.is_empty local_defs then assignments
+        else if PPrint.is_empty local_defs then vec_decl ^^ hardline ^^ assignments
         else
-          let block_content = local_defs ^^ hardline ^^ assignments in
+          let block_content = local_defs ^^ hardline ^^ vec_decl ^^ hardline ^^ assignments in
           lbrace ^^ nest 2 (hardline ^^ block_content) ^^ hardline ^^ rbrace
     | Set_local (({ tn = { prec; _ }; _ } as id), value) ->
         let local_defs, value_doc = pp_scalar (Lazy.force prec) value in
@@ -969,7 +939,7 @@ module C_syntax (B : C_syntax_config) = struct
                 in
                 match source with
                 | Merge_buffer ->
-                    let merge_tn = Option.value_exn merge_node in
+                    let merge_tn = Option.value_exn ~here:[%here] merge_node in
                     let base_msg =
                       Printf.sprintf "%s &[%d] = %%p\n" p_name_and_type (Tnode.num_elems merge_tn)
                     in
@@ -994,10 +964,6 @@ module C_syntax (B : C_syntax_config) = struct
        in
        body := !body ^^ debug_init_doc ^^ hardline);
 
-    let heap_allocated = ref [] in
-    let stack_threshold_in_bytes =
-      Int.of_string @@ Utils.get_global_arg ~default:"16384" ~arg_name:"stack_threshold_in_bytes"
-    in
     let local_decls =
       string "/* Local declarations and initialization. */"
       ^^ hardline
@@ -1008,24 +974,8 @@ module C_syntax (B : C_syntax_config) = struct
                let ident_doc = string (get_ident tn) in
                let num_elems = Tn.num_elems tn in
                let size_doc = OCaml.int num_elems in
-               (* Use heap allocation for arrays larger than stack_threshold_in_bytes to avoid stack
-                  overflow in Domain threads *)
-
-               if
-                 Option.is_some B.local_heap_alloc && stack_threshold_in_bytes > 0
-                 && num_elems > stack_threshold_in_bytes / (Ops.prec_in_bytes @@ Lazy.force tn.prec)
-               then (
-                 (* Heap allocation for large arrays *)
-                 heap_allocated := get_ident tn :: !heap_allocated;
-                 Option.value_exn B.local_heap_alloc
-                   ~zero_initialized:node.Low_level.zero_initialized ~num_elems ~typ_doc ~ident_doc
-                 ^^ semi ^^ hardline)
-               else
-                 (* Stack allocation for small arrays *)
-                 let init_doc =
-                   if node.Low_level.zero_initialized then string " = {0}" else empty
-                 in
-                 typ_doc ^^ space ^^ ident_doc ^^ brackets size_doc ^^ init_doc ^^ semi ^^ hardline
+               let init_doc = if node.Low_level.zero_initialized then string " = {0}" else empty in
+               typ_doc ^^ space ^^ ident_doc ^^ brackets size_doc ^^ init_doc ^^ semi ^^ hardline
              else empty)
            (Hashtbl.to_alist traced_store)
     in
@@ -1033,17 +983,6 @@ module C_syntax (B : C_syntax_config) = struct
 
     let main_logic = string "/* Main logic. */" ^^ hardline ^^ compile_main llc in
     body := !body ^^ main_logic;
-
-    (* Free heap-allocated arrays *)
-    if Option.is_some B.local_heap_dealloc && not (List.is_empty !heap_allocated) then
-      body :=
-        !body ^^ hardline
-        ^^ string "/* Cleanup heap-allocated arrays. */"
-        ^^ hardline
-        ^^ separate_map hardline
-             (fun ident -> Option.value_exn B.local_heap_dealloc ~ident_doc:(string ident) ^^ semi)
-             !heap_allocated
-        ^^ hardline;
 
     if Utils.debug_log_from_routines () && B.log_involves_file_management then
       body :=

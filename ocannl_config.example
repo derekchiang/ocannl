@@ -89,6 +89,7 @@ output_dlls_in_build_directory=false
 
 # Per-tensor-node cutoff in bytes for considering off-stack allocation, opt-in for backends.
 # Decrease it if you see crashes like `bus error`. Values smaller-or-equal 0 mean "no limits".
+# Tensors exceeding this size will be allocated on the device's global memory.
 stack_threshold_in_bytes=16384
 
 # Only tensor nodes with up to this many visits per array cell (in a dedicated interpreter)
@@ -111,7 +112,8 @@ inline_simple_computations=true
 # If true, virtualize_max_visits only counts accesses that are not used for assignment of
 # the same cell (typically accumulation). Otherwise, all accesses are counted, so computations
 # that reduce an axis will rarely be inlined.
-inline_complex_computations=true
+# FIXME(#351): avoid excessive inlining while CSE is not implemented
+inline_complex_computations=false
 
 # The random number library. Options: `stdlib` -- `Base.Random`;
 # `for_tests` -- simplistic randomness with 32 bit seed, focused on reproducibility.

@@ -5,8 +5,10 @@ module Tn = Tnode
 
 let _get_local_debug_runtime = Utils.get_local_debug_runtime
 
-[%%global_debug_log_level 9]
-[%%global_debug_log_level_from_env_var "OCANNL_LOG_LEVEL"]
+[%%global_debug_log_level 0]
+
+(* export OCANNL_LOG_LEVEL_LOW_LEVEL=9 to enable debugging into the log_files/ directory. *)
+[%%global_debug_log_level_from_env_var "OCANNL_LOG_LEVEL_LOW_LEVEL"]
 
 module Scope_id = struct
   type t = { tn : Tn.t; scope_id : int } [@@deriving sexp_of, equal, hash, compare]
@@ -85,6 +87,7 @@ type virtualize_settings = {
   mutable max_tracing_dim : int;
   mutable inline_scalar_constexprs : bool;
   mutable inline_simple_computations : bool;
+  mutable inline_complex_computations : bool;
 }
 
 let virtualize_settings =
@@ -101,12 +104,17 @@ let virtualize_settings =
   let inline_simple_computations =
     Utils.get_global_flag ~default:true ~arg_name:"inline_simple_computations"
   in
+  let inline_complex_computations =
+    (* TODO(#351): change to true once CSE is implemented *)
+    Utils.get_global_flag ~default:false ~arg_name:"inline_complex_computations"
+  in
   {
     enable_device_only;
     max_visits;
     max_tracing_dim;
     inline_scalar_constexprs;
     inline_simple_computations;
+    inline_complex_computations;
   }
 
 type visits = Visits of int | Recurrent [@@deriving sexp, equal, variants]
@@ -221,9 +229,7 @@ let is_complex_comp traced_store llsc =
 let is_scalar_dims tn = Array.for_all ~f:(( = ) 1) @@ Lazy.force tn.Tn.dims
 
 let visit_llc traced_store ~merge_node_id reverse_node_map ~max_visits llc =
-  let inline_complex_computations =
-    Utils.get_global_flag ~default:true ~arg_name:"inline_complex_computations"
-  in
+  (* FIXME(#351): avoid excessive inlining while CSE is not implemented *)
   let is_too_many = function Visits i -> i > max_visits | Recurrent -> true in
   (* FIXME: migrate hashtable to use offsets instead of indices *)
   let lookup env indices =
@@ -338,7 +344,7 @@ let visit_llc traced_store ~merge_node_id reverse_node_map ~max_visits llc =
         let traced : traced_array = get_node traced_store ptr in
         let at_pos = lookup env indices in
         if
-          (not inline_complex_computations)
+          (not virtualize_settings.inline_complex_computations)
           || Option.value_map access_pos ~default:true ~f:(fun pos ->
                  not ([%equal: int array] pos at_pos))
         then

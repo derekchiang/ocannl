@@ -15,8 +15,10 @@ type projections = { projections_debug : string; projections : Ir.Indexing.proje
 
 let _get_local_debug_runtime = Utils.get_local_debug_runtime
 
-[%%global_debug_log_level 9]
-[%%global_debug_log_level_from_env_var "OCANNL_LOG_LEVEL"]
+[%%global_debug_log_level 0]
+
+(* export OCANNL_LOG_LEVEL_TENSOR=9 to enable debugging into the log_files/ directory. *)
+[%%global_debug_log_level_from_env_var "OCANNL_LOG_LEVEL_TENSOR"]
 
 type diff = { grad : (Tn.t[@sexp.opaque]); zero_grads : Asgns.t; backprop : Asgns.comp }
 [@@deriving sexp_of]
@@ -112,27 +114,30 @@ let iter_embedded ~f t =
   Set.iter ~f t.forward.embedded_nodes;
   Option.iter t.diff ~f:(fun diff -> Set.iter ~f diff.backprop.embedded_nodes)
 
-let rec init_params ?skip t =
-  let open Asgns in
-  let rem_embedded = ref @@ Set.empty (module Tn) in
-  let params =
-    match skip with
-    | None -> t.params
-    | Some skip -> Set.filter t.params ~f:(fun p -> not (Map.mem skip p.value))
+let%debug7_sexp rec init_params ?skip (t : t) : Asgns.comp =
+  let more_embedded = ref @@ Set.empty (module Tn) in
+  let params : t list =
+    Set.to_list t.params
+    |> (match skip with
+       | None -> Fn.id
+       | Some skip -> List.filter ~f:(fun p -> not (Map.mem skip p.value)))
+       (* Compare to ordered_ts in op -- we need to sort to avoid computed-after-use bugs! *)
+    |> List.sort ~compare:(fun p1 p2 -> Int.ascending p1.id p2.id)
   in
   let asgns =
-    Block_comment
+    Asgns.Block_comment
       ( "init params for " ^ Tn.debug_name t.value,
-        sequential
-        @@ Set.fold params ~init:[] ~f:(fun acc param ->
-               if Set.is_empty param.params then param.forward.asgns :: acc
-               else
-                 let asgns = init_params ?skip param in
-                 rem_embedded := Set.union !rem_embedded asgns.embedded_nodes;
-                 Seq (asgns.asgns, param.forward.asgns) :: acc) )
+        List.fold_right params ~init:Asgns.Noop ~f:(fun param acc ->
+            if Set.is_empty param.params then Asgns.Seq (param.forward.asgns, acc)
+            else
+              let comp = init_params ?skip param in
+              more_embedded := Set.union !more_embedded comp.Asgns.embedded_nodes;
+              Seq (Seq (comp.Asgns.asgns, param.forward.asgns), acc)) )
   in
-  let embedded_nodes = Set.fold ~init:!rem_embedded params ~f:(fun acc p -> Set.add acc p.value) in
-  { asgns; embedded_nodes }
+  let embedded_nodes =
+    List.fold params ~init:!more_embedded ~f:(fun acc p -> Set.add acc p.value)
+  in
+  { Asgns.asgns; embedded_nodes }
 
 let initial_default_prec =
   Ir.Ops.prec_of_string (Utils.get_global_arg ~default:"single" ~arg_name:"default_prec")
@@ -477,8 +482,8 @@ let%track7_sexp term ?init_data ?fetch_op ?grad_spec ?(label = []) ?(top_down_pr
     match fetch_op with
     | None -> Asgns.empty_comp
     | Some
-        (( Constant _ | Constant_bits _ | Slice _ | Embed_symbol _ | Embed_self_id | Range_over_offsets
-         | Constant_fill _ ) as fetch_op) ->
+        (( Constant _ | Constant_bits _ | Slice _ | Embed_symbol _ | Embed_self_id
+         | Range_over_offsets | Constant_fill _ ) as fetch_op) ->
         Asgns.to_comp @@ Fetch { array = v; fetch_op; dims }
   in
   let grad_asn ~t:_ ~g:_ ~projections:_ = Asgns.empty_comp in

@@ -8,6 +8,149 @@
 #include <string.h>
 #include <stdlib.h>
 
+/* Check for _Float16 support and define macros for zero-overhead abstraction */
+#ifdef __FLT16_MAX__
+  #define HAS_NATIVE_FLOAT16 1
+  /* Native _Float16 support - use direct types and casts */
+  #define HALF_T _Float16
+  #define HALF_TO_FP(x) (x)  /* Identity - already in floating point */
+  #define FP_TO_HALF(x) (x)  /* Identity - already half precision */
+  #define HALF_TO_FLOAT(x) ((float)(x))
+  #define FLOAT_TO_HALF(x) ((_Float16)(x))
+  #define HALF_TO_UINT16(x) ({ _Float16 _h = (x); uint16_t _r; memcpy(&_r, &_h, 2); _r; })
+  #define UINT16_TO_HALF(x) ({ uint16_t _u = (x); _Float16 _h; memcpy(&_h, &_u, 2); _h; })
+#else
+  #define HAS_NATIVE_FLOAT16 0
+  /* No native _Float16 - use uint16_t storage and conversion functions */
+  #define HALF_T uint16_t
+  #define HALF_TO_FP(x) half_to_float_emulated(x)  /* Convert to float for computation */
+  #define FP_TO_HALF(x) float_to_half_emulated(x)  /* Convert back from float */
+  #define HALF_TO_FLOAT(x) half_to_float_emulated(x)
+  #define FLOAT_TO_HALF(x) float_to_half_emulated(x)
+  #define HALF_TO_UINT16(x) (x)
+  #define UINT16_TO_HALF(x) (x)
+#endif
+
+/* Float16 emulation functions for systems without _Float16 */
+#if !HAS_NATIVE_FLOAT16
+
+/* Convert IEEE 754 half precision (stored as uint16_t) to float */
+static float half_to_float_emulated(uint16_t h) {
+    uint32_t sign = (h >> 15) & 0x1;
+    uint32_t exponent = (h >> 10) & 0x1F;
+    uint32_t mantissa = h & 0x3FF;
+    
+    if (exponent == 0) {
+        if (mantissa == 0) {
+            /* Zero */
+            return sign ? -0.0f : 0.0f;
+        } else {
+            /* Subnormal */
+            float result = ldexpf(mantissa / 1024.0f, -14);
+            return sign ? -result : result;
+        }
+    } else if (exponent == 31) {
+        if (mantissa == 0) {
+            /* Infinity */
+            return sign ? -INFINITY : INFINITY;
+        } else {
+            /* NaN */
+            return NAN;
+        }
+    } else {
+        /* Normal number */
+        float result = ldexpf(1.0f + mantissa / 1024.0f, exponent - 15);
+        return sign ? -result : result;
+    }
+}
+
+/* Convert float to IEEE 754 half precision (stored as uint16_t) */
+static uint16_t float_to_half_emulated(float f) {
+    uint32_t f32;
+    memcpy(&f32, &f, sizeof(float));
+    
+    uint32_t sign = (f32 >> 31) & 0x1;
+    uint32_t exponent = (f32 >> 23) & 0xFF;
+    uint32_t mantissa = f32 & 0x7FFFFF;
+    
+    /* Convert exponent from float bias (127) to half bias (15) */
+    int32_t new_exp = (int32_t)exponent - 127 + 15;
+    
+    if (exponent == 0xFF) {
+        /* Infinity or NaN */
+        if (mantissa == 0) {
+            /* Infinity */
+            return (sign << 15) | (0x1F << 10);
+        } else {
+            /* NaN - preserve sign and set mantissa bit */
+            return (sign << 15) | (0x1F << 10) | 0x200;
+        }
+    } else if (new_exp <= 0) {
+        /* Underflow to zero or subnormal */
+        if (new_exp < -10) {
+            /* Too small - flush to zero */
+            return sign << 15;
+        }
+        /* Subnormal - with round-to-nearest-even */
+        uint32_t shift = -new_exp + 1;
+        mantissa = (mantissa | 0x800000);
+        
+        /* For subnormal, we need to shift right by (shift + 13) total bits */
+        uint32_t total_shift = shift + 13;
+        
+        if (total_shift >= 24) {
+            /* Would shift away all bits */
+            return sign << 15;
+        }
+        
+        /* Extract guard, round, and sticky bits before shifting */
+        uint32_t guard_bit = (mantissa >> (total_shift - 1)) & 1;
+        uint32_t round_bit = total_shift > 1 ? ((mantissa >> (total_shift - 2)) & 1) : 0;
+        uint32_t sticky_mask = (1U << (total_shift - 2)) - 1;
+        uint32_t sticky_bits = total_shift > 1 ? (mantissa & sticky_mask) : 0;
+        
+        mantissa = mantissa >> total_shift;
+        
+        /* Round to nearest even */
+        if (guard_bit && (round_bit || sticky_bits || (mantissa & 1))) {
+            mantissa++;
+        }
+        
+        return (sign << 15) | mantissa;
+    } else if (new_exp >= 0x1F) {
+        /* Overflow to infinity */
+        return (sign << 15) | (0x1F << 10);
+    } else {
+        /* Normal number - with round-to-nearest-even (banker's rounding) */
+        uint32_t rounded_mantissa;
+        uint32_t guard_bit = (mantissa >> 12) & 1;
+        uint32_t round_bit = (mantissa >> 11) & 1;
+        uint32_t sticky_bits = mantissa & 0x7FF;
+        
+        rounded_mantissa = mantissa >> 13;
+        
+        /* Round to nearest even: round up if we have:
+         * - guard bit set and (round bit set OR sticky bits non-zero OR mantissa LSB set)
+         */
+        if (guard_bit && (round_bit || sticky_bits || (rounded_mantissa & 1))) {
+            rounded_mantissa++;
+        }
+        
+        if (rounded_mantissa > 0x3FF) {
+            /* Rounding caused overflow in mantissa */
+            new_exp++;
+            rounded_mantissa = 0;
+            if (new_exp >= 0x1F) {
+                /* Overflow to infinity */
+                return (sign << 15) | (0x1F << 10);
+            }
+        }
+        return (sign << 15) | (new_exp << 10) | rounded_mantissa;
+    }
+}
+
+#endif /* !HAS_NATIVE_FLOAT16 */
+
 /* Threefry4x32 types and implementation */
 
 typedef struct {
@@ -145,7 +288,7 @@ typedef struct { int64_t v[2]; } int64x2_t;
 typedef struct { int8_t v[16]; } int8x16_t;
 typedef struct { uint16_t v[8]; } uint16x8_t;
 typedef struct { uint8_t v[16]; } uint8x16_t;
-typedef struct { _Float16 v[8]; } half8_t;
+typedef struct { HALF_T v[8]; } half8_t;
 
 /* Conversion functions from uint4x32 to various precisions uniformly */
 // These return vectors to efficiently use all random bits
@@ -208,29 +351,17 @@ extern uint16_t uint4x32_to_bfloat16_uniform(uint4x32_t x) {
     float f = uint32_to_single_uniform(x.v[0]);
     uint32_t bits;
     memcpy(&bits, &f, sizeof(float));
-    return (uint16_t)(bits >> 16);
+    /* Round to nearest even for bfloat16 */
+    uint16_t bf = bits >> 16;
+    if ((bits & 0x8000) && ((bits & 0x7FFF) || (bf & 1))) bf++;
+    return bf;
 }
 
 /* Uint4x32 to float16 uniform - uses first 16 bits */
 extern uint16_t uint4x32_to_half_uniform(uint4x32_t x) {
-    /* Simplified conversion - proper fp16 would need more complex handling */
-    /* This creates a uniform distribution in [0, 1) for fp16 */
-    uint16_t raw = (uint16_t)(x.v[0] & 0xFFFF);
-    /* Map to [0, 1) range in fp16 format */
-    /* Sign bit = 0, exponent between -14 and 0, mantissa from raw bits */
-    if (raw == 0) return 0;
-    
-    /* Find the highest set bit */
-    int shift = 0;
-    uint16_t temp = raw;
-    while (temp >>= 1) shift++;
-    
-    /* Normalize mantissa */
-    uint16_t mantissa = (raw << (10 - shift)) & 0x3FF;
-    /* Exponent for values in [0, 1) */
-    uint16_t exponent = 14 - shift;
-    
-    return (exponent << 10) | mantissa;
+    /* Convert through float for consistent behavior */
+    float f = (x.v[0] & 0xFFFF) * (1.0f / 65536.0f);
+    return FLOAT_TO_HALF(f);
 }
 
 /* Uint4x32 to fp8 uniform - uses first 8 bits */
@@ -309,8 +440,14 @@ extern uint16x8_t uint4x32_to_bfloat16_uniform_vec(uint4x32_t x) {
         uint32_t bits1, bits2;
         memcpy(&bits1, &f1, sizeof(float));
         memcpy(&bits2, &f2, sizeof(float));
-        result.v[i*2 + 0] = (uint16_t)(bits1 >> 16);
-        result.v[i*2 + 1] = (uint16_t)(bits2 >> 16);
+        // Round to nearest even for bfloat16
+        uint16_t bf1 = bits1 >> 16;
+        uint16_t bf2 = bits2 >> 16;
+        // Check if we need to round up (guard bit set and round/sticky or LSB)
+        if ((bits1 & 0x8000) && ((bits1 & 0x7FFF) || (bf1 & 1))) bf1++;
+        if ((bits2 & 0x8000) && ((bits2 & 0x7FFF) || (bf2 & 1))) bf2++;
+        result.v[i*2 + 0] = bf1;
+        result.v[i*2 + 1] = bf2;
     }
     return result;
 }
@@ -323,9 +460,9 @@ extern half8_t uint4x32_to_half_uniform_vec(uint4x32_t x) {
         float f1 = (x.v[i] & 0xFFFF) * (1.0f / 65536.0f);
         float f2 = ((x.v[i] >> 16) & 0xFFFF) * (1.0f / 65536.0f);
         
-        // Convert to _Float16
-        result.v[i*2 + 0] = (_Float16)f1;
-        result.v[i*2 + 1] = (_Float16)f2;
+        // Convert to half precision - macros handle both native and emulated cases
+        result.v[i*2 + 0] = FLOAT_TO_HALF(f1);
+        result.v[i*2 + 1] = FLOAT_TO_HALF(f2);
     }
     return result;
 }
@@ -422,6 +559,20 @@ extern uint16_t single_to_bfloat16(float f)
   /* Round to nearest even */
   uint32_t rounded = f32 + 0x7FFF + ((f32 >> 16) & 1);
   return (uint16_t)(rounded >> 16);
+}
+
+/* Half (Float16) to Float conversion (C function) */
+extern float half_to_single(uint16_t h)
+{
+  HALF_T half_val = UINT16_TO_HALF(h);
+  return HALF_TO_FLOAT(half_val);
+}
+
+/* Float to Half (Float16) conversion (C function) */
+extern uint16_t single_to_half(float f)
+{
+  HALF_T half_val = FLOAT_TO_HALF(f);
+  return HALF_TO_UINT16(half_val);
 }
 
 /* FP8 E5M2 format to Float conversion (C function)
@@ -753,6 +904,24 @@ CAMLprim value arrayjit_single_to_bfloat16(value v_float)
   float f = (float)Double_val(v_float);
   uint16_t bf16 = single_to_bfloat16(f);
   CAMLreturn(Val_int(bf16));
+}
+
+/* Half (Float16) to Float conversion (OCaml wrapper) */
+CAMLprim value arrayjit_half_to_single(value v_half)
+{
+  CAMLparam1(v_half);
+  uint16_t half = (uint16_t)Int_val(v_half);
+  float result = half_to_single(half);
+  CAMLreturn(caml_copy_double((double)result));
+}
+
+/* Float to Half (Float16) conversion (OCaml wrapper) */
+CAMLprim value arrayjit_single_to_half(value v_float)
+{
+  CAMLparam1(v_float);
+  float f = (float)Double_val(v_float);
+  uint16_t half = single_to_half(f);
+  CAMLreturn(Val_int(half));
 }
 
 /* FP8 E5M2 format to Float conversion (OCaml wrapper) */

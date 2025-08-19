@@ -139,8 +139,17 @@ end) : Ir.Backend_impl.Lowered_backend = struct
     let with_debug =
       Utils.settings.output_debug_files_in_build_directory || Utils.settings.log_level > 0
     in
+    let cuda_include_opt =
+      match Sys.getenv "CUDA_PATH" with
+      | Some cuda_path -> [ "-I" ^ cuda_path ^ "/include" ]
+      | None -> (
+          (* Fallback to common location if CUDA_PATH is not set *)
+          if Stdlib.Sys.file_exists "/usr/local/cuda/include" then [ "-I/usr/local/cuda/include" ]
+          else [])
+    in
     let options =
-      "--use_fast_math" :: (if Utils.with_runtime_debug () then [ "--device-debug" ] else [])
+      cuda_include_opt @ ("--use_fast_math"
+      :: (if Utils.with_runtime_debug () then [ "--device-debug" ] else []))
     in
     (* FIXME: every now and then the compilation crashes because the options are garbled. *)
     (* Stdio.printf "PTX options %s\n%!" @@ String.concat ~sep:", " options; *)
@@ -294,8 +303,6 @@ end) : Ir.Backend_impl.Lowered_backend = struct
 
     let kernel_prep_line =
       "/* FIXME: single-threaded for now. */if (threadIdx.x != 0 || blockIdx.x != 0) { return; }"
-
-    let includes = [ "<cuda_fp16.h>"; "<cuda_bf16.h>" ]
 
     let typ_of_prec = function
       | Ops.Byte_prec _ -> "unsigned char"
@@ -682,7 +689,6 @@ end) : Ir.Backend_impl.Lowered_backend = struct
       | FMA, Ops.Single_prec _ -> func "fmaf"
       | FMA, _ -> func "fma"
 
-    let extra_declarations = []
 
     let convert_precision ~from ~to_ =
       match (from, to_) with
@@ -761,15 +767,10 @@ end) : Ir.Backend_impl.Lowered_backend = struct
     end)) in
     let idx_params = Indexing.bound_symbols bindings in
     let b = Buffer.create 4096 in
-    let declarations_doc = Syntax.print_declarations () in
-    let params, proc_doc = Syntax.compile_proc ~name idx_params lowered in
-    let final_doc = PPrint.(declarations_doc ^^ proc_doc) in
-    PPrint.ToBuffer.pretty 1.0 110 b final_doc;
-    (* Prepend builtins after syntax generation to preserve include order *)
-    let full_source = Buffer.contents b in
-    Buffer.clear b;
+    (* Prepend builtins first *)
     prepend_builtins b;
-    Buffer.add_string b full_source;
+    let params, proc_doc = Syntax.compile_proc ~name idx_params lowered in
+    PPrint.ToBuffer.pretty 1.0 110 b proc_doc;
     let ptx = cuda_to_ptx ~name (Buffer.contents b) in
     { traced_store; ptx; params; bindings; name }
 
@@ -779,7 +780,8 @@ end) : Ir.Backend_impl.Lowered_backend = struct
     end)) in
     let idx_params = Indexing.bound_symbols bindings in
     let b = Buffer.create 4096 in
-    let declarations_doc = Syntax.print_declarations () in
+    (* Prepend builtins first *)
+    prepend_builtins b;
     let params_and_docs =
       Array.map2_exn names lowereds
         ~f:
@@ -788,13 +790,8 @@ end) : Ir.Backend_impl.Lowered_backend = struct
                ((params, name), doc)))
     in
     let all_proc_docs = List.filter_map (Array.to_list params_and_docs) ~f:(Option.map ~f:snd) in
-    let final_doc = PPrint.(declarations_doc ^^ separate hardline all_proc_docs) in
+    let final_doc = PPrint.(separate hardline all_proc_docs) in
     PPrint.ToBuffer.pretty 1.0 110 b final_doc;
-    (* Prepend builtins after syntax generation to preserve include order *)
-    let full_source = Buffer.contents b in
-    Buffer.clear b;
-    prepend_builtins b;
-    Buffer.add_string b full_source;
 
     let name : string =
       String.(

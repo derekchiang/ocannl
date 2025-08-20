@@ -60,8 +60,8 @@ let () =
   Tensor.unsafe_reinitialize ();
 
   let names = Datasets.Names.read_names () in
-  let embeddings_size = 2 in
-  let context_size = 3 in
+  let embeddings_size = 5 in
+  let context_size = 5 in
   let dataset = make_dataset names context_size in
   Stdio.printf "dataset size: %d\n%!" (List.length dataset);
   let batch_size = 1000 in
@@ -83,25 +83,23 @@ let () =
 
   (* Train.printf ~here:[%here] ~with_code:false ~with_grad:false input; *)
   let hid_dim = 100 in
+  (* Define embeddings parameter outside mlp so it can be shared *)
+  let%op ebs =
+    TDSL.param ~output_dims:[ Datasets.Names.dict_size; embeddings_size ] "embeddings" ()
+  in
   let%op mlp input =
-    (* w1 is the embeddings *)
-    (* For embeddings: we want to map from dict_size space to embeddings_size space
-       input has shape [context_size; dict_size] where dict_size is in output position
-       We need to reshape input to have dict_size in input position for multiplication *)
-    let ebs =
-      TDSL.param ~output_dims:[ Datasets.Names.dict_size; embeddings_size ] "embeddings" ()
-    in
     (* Train.printf ~here:[%here] ~with_code:false ~with_grad:false ebs; *)
     let input_ebs = input *+ "b|ij; b|jk => b|ik" ebs in
     (* let first_layer = "w1" *+ "b|ik->g; b|ik => b|g" input_ebs *)
-    let logits =
-      "b2" Datasets.Names.dict_size + ("w2" * tanh ("b1" hid_dim + ("w1" * input_ebs)))
-    in
+    (* Scale down the linear layer outputs to prevent exploding gradients *)
+    let hidden = tanh ("b1" hid_dim + ("w1" * input_ebs)) in
+    let logits = "b2" Datasets.Names.dict_size + ("w2" * hidden *. 0.1) in
     let counts = exp logits in
     counts /. (counts ++ "...|... => ...|0")
   in
 
   let%op output_probs = (mlp input *. output) ++ "...|... => ...|0" in
+  (* Add small epsilon for numerical stability *)
   let%op loss = neg (log output_probs) in
   let%op batch_loss = (loss ++ "...|... => 0") /. !..batch_size in
 
@@ -111,25 +109,29 @@ let () =
   Train.every_non_literal_on_host batch_loss;
 
   let update = Train.grad_update batch_loss in
-  let%op learning_rate = 0.1 in
+  let%op learning_rate = 1 in
   let sgd = Train.sgd_update ~learning_rate batch_loss in
 
   let module Backend = (val Backends.fresh_backend ()) in
   let ctx = Train.init_params (module Backend) bindings batch_loss in
   let sgd_step = Train.to_routine (module Backend) ctx bindings (Asgns.sequence [ update; sgd ]) in
-  Train.printf w1 ~with_grad:false;
 
   let open Operation.At in
   let batch_ref = IDX.find_exn sgd_step.bindings batch_n in
   for epoch = 0 to 100 do
+    let epoch_loss = ref 0. in
     for batch = 0 to n_batches - 1 do
       batch_ref := batch;
-      Train.run sgd_step
+      Train.run sgd_step;
+      let loss = batch_loss.@[0] in
+      if Float.is_nan loss then Stdio.printf "NaN detected at epoch %d, batch %d\n%!" epoch batch;
+      epoch_loss := !epoch_loss +. loss
     done;
-    Stdio.printf "Epoch %d, loss=%f\n%!" epoch batch_loss.@[0]
+    let avg_loss = !epoch_loss /. Float.of_int n_batches in
+    Stdio.printf "Epoch %d, avg_loss=%f, last_batch_loss=%f\n%!" epoch avg_loss batch_loss.@[0]
   done;
-  Train.printf_tree batch_loss;
 
+  (* Train.printf_tree batch_loss; *)
   let counter_n, bindings = IDX.get_static_symbol IDX.empty in
   let%cd infer_probs = mlp "cha" in
   let%cd infer_step =
@@ -149,7 +151,7 @@ let () =
     let dice_value = dice.@[0] in
 
     let rec aux i sum =
-      let prob = infer_probs.@{[| i |]} in
+      let prob = infer_probs.@{[| 0; i |]} in
       let new_sum = sum +. prob in
       if Float.compare new_sum dice_value > 0 then List.nth_exn Datasets.Names.letters_with_dot i
       else aux (i + 1) new_sum
